@@ -1,0 +1,2 @@
+- [Tinkar dependency alignment](tinkar-dependency-alignment.md) — use coordinated service/schema/core revisions; public snapshots may lag current source.
+- [Java toolchain labels](java-toolchain-labels.md) — a GraalVM module version is not the Java language version; verify the actual JDK.
