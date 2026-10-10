@@ -1,0 +1,3208 @@
+package dev.ikm.tinkar.service.service.impl;
+
+import org.eclipse.collections.api.factory.primitive.LongSets;
+
+import org.eclipse.collections.api.set.primitive.MutableLongSet;
+
+import dev.ikm.tinkar.entity.changeset.SchemaIds;
+import dev.ikm.tinkar.common.id.*;
+import dev.ikm.tinkar.common.service.EntityCountSummary;
+import dev.ikm.tinkar.common.service.TrackingListener;
+import dev.ikm.tinkar.entity.export.ExportEntitiesToProtobufFile;
+import dev.ikm.tinkar.service.dto.ExportRequest;
+import dev.ikm.tinkar.common.id.PublicId;
+import dev.ikm.tinkar.common.id.PublicIds;
+import java.util.UUID;
+import dev.ikm.tinkar.common.service.DataServiceController;
+import dev.ikm.tinkar.common.service.PluggableService;
+import dev.ikm.tinkar.common.service.PrimitiveData;
+import dev.ikm.tinkar.common.service.ServiceExclusionGroup;
+import dev.ikm.tinkar.common.service.ServiceLifecycleManager;
+import dev.ikm.tinkar.common.service.TrackingCallable;
+import dev.ikm.tinkar.coordinate.Calculators;
+import dev.ikm.tinkar.coordinate.stamp.calculator.Latest;
+import dev.ikm.tinkar.coordinate.stamp.calculator.LatestVersionSearchResult;
+import dev.ikm.tinkar.coordinate.stamp.change.ChangeChronology;
+import dev.ikm.tinkar.coordinate.stamp.change.FieldChangeRecord;
+import dev.ikm.tinkar.coordinate.stamp.change.VersionChangeRecord;
+import dev.ikm.tinkar.coordinate.view.calculator.ViewCalculatorWithCache;
+import dev.ikm.tinkar.entity.*;
+import dev.ikm.tinkar.entity.load.LoadEntitiesFromProtobufFile;
+import dev.ikm.tinkar.entity.transform.EntityToTinkarSchemaTransformer;
+import dev.ikm.tinkar.entity.transform.TinkarSchemaToEntityTransformer;
+import dev.ikm.tinkar.entity.transaction.Transaction;
+import dev.ikm.tinkar.reasoner.service.ClassifierResults;
+import dev.ikm.tinkar.reasoner.service.ReasonerService;
+import dev.ikm.tinkar.schema.StampVersion;
+import dev.ikm.tinkar.schema.TinkarMsg;
+import dev.ikm.tinkar.service.dto.*;
+import dev.ikm.tinkar.service.dto.ChangeHistoryResponse.FieldChange;
+import dev.ikm.tinkar.service.dto.ChangeHistoryResponse.StampInfo;
+import dev.ikm.tinkar.service.dto.ChangeHistoryResponse.VersionChange;
+import dev.ikm.tinkar.service.dto.ConceptSearchResponse.GroupedSearchResult;
+import dev.ikm.tinkar.service.dto.ConceptSearchResponse.MatchingSemantic;
+import dev.ikm.tinkar.service.dto.ConceptSearchResponse.SemanticSearchResult;
+import dev.ikm.tinkar.service.dto.ConceptSemanticsResponse.FieldValue;
+import dev.ikm.tinkar.service.dto.ConceptSemanticsResponse.SemanticInfo;
+import dev.ikm.tinkar.service.dto.SearchSortOption;
+import dev.ikm.tinkar.service.proto.*;
+import dev.ikm.tinkar.service.proto.TinkarSearchQueryResponse;
+import dev.ikm.tinkar.service.service.TinkarPrimitive;
+import dev.ikm.tinkar.service.service.ReasonerPhaseListener;
+import dev.ikm.tinkar.service.service.TinkarService;
+import dev.ikm.tinkar.service.util.ProtoConversionUtils;
+import dev.ikm.tinkar.entity.graph.DiTreeEntity;
+import dev.ikm.tinkar.entity.graph.DiTreeText;
+import dev.ikm.tinkar.entity.graph.EntityVertex;
+import dev.ikm.tinkar.terms.EntityBinding;
+import dev.ikm.tinkar.terms.EntityFacade;
+import dev.ikm.tinkar.terms.EntityProxy;
+import dev.ikm.tinkar.terms.KernelTerm;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.eclipse.collections.api.factory.Lists;
+import org.eclipse.collections.api.set.primitive.MutableIntSet;
+import org.eclipse.collections.impl.factory.primitive.IntSets;
+import org.springframework.stereotype.Service;
+
+import java.io.File;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.stream.Stream;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+
+@Service
+public class TinkarServiceImpl implements TinkarService {
+    private static final Logger log = LoggerFactory.getLogger(TinkarServiceImpl.class);
+
+    private final TinkarPrimitive primitive;
+
+    private static final int MAX_RESULTS = 100;
+
+    /**
+     * The text written for a component this store has no public id for. It has no identifier in
+     * it: the only one there is, the nid, is never written in a response.
+     */
+    static final String UNIDENTIFIED = "unidentified component";
+
+    public TinkarServiceImpl(TinkarPrimitive primitive) {
+        this.primitive = primitive;
+    }
+
+    /**
+     * Returns the provided calculator if non-null, otherwise the server default.
+     */
+    private ViewCalculatorWithCache resolveCalculator(ViewCalculatorWithCache provided) {
+        return provided != null ? provided : Calculators.View.Default();
+    }
+
+    @Override
+    public TinkarSearchQueryResponse search(String query) {
+        try {
+            List<PublicId> searchResults = primitive.search(query, MAX_RESULTS);
+            List<TinkarSearchResult> results = searchResults.stream()
+                    .map(this::publicIdToSearchResult)
+                    .toList();
+
+            return buildSuccessResponse(query, results);
+        } catch (IllegalStateException e) {
+            if (isEmptyDatabaseError(e)) {
+                log.debug("Search on empty/fresh database returned no results for query '{}'", query);
+                return buildSuccessResponse(query, List.of());
+            }
+            return buildErrorResponse(query, e.getMessage());
+        } catch (Exception e) {
+            return buildErrorResponse(query, e.getMessage());
+        }
+    }
+
+    @Override
+    public TinkarSearchQueryResponse conceptSearch(String query, Integer maxResults) {
+        try {
+            int limit = (maxResults != null && maxResults > 0) ? maxResults : MAX_RESULTS;
+
+            List<TinkarSearchResult> results = Calculators.View.Default()
+                    .search(query, limit).stream()
+                    .map(LatestVersionSearchResult::latestVersion)
+                    .filter(Latest::isPresent)
+                    .map(latestVersion -> latestVersion.get().referencedComponent().publicId())
+                    .distinct()
+                    .map(this::publicIdToSearchResult)
+                    .toList();
+
+            return buildSuccessResponse(query, results);
+        } catch (IllegalStateException e) {
+            if (isEmptyDatabaseError(e)) {
+                log.debug("conceptSearch on empty/fresh database returned no results for query '{}'", query);
+                return buildSuccessResponse(query, List.of());
+            }
+            return buildErrorResponse(query, e.getMessage());
+        } catch (Exception e) {
+            return buildErrorResponse(query, e.getMessage());
+        }
+    }
+
+    @Override
+    public ConceptSearchResponse conceptSearchWithSort(String query, Integer maxResults, SearchSortOption sortBy) {
+        try {
+            int limit = (maxResults != null && maxResults > 0) ? maxResults : MAX_RESULTS;
+            SearchSortOption effectiveSortBy = (sortBy != null) ? sortBy : SearchSortOption.TOP_COMPONENT;
+
+            // Execute the search
+            List<LatestVersionSearchResult> searchResults = Calculators.View.Default()
+                    .search(query, limit)
+                    .toList();
+
+            log.debug("Search for '{}' returned {} raw results", query, searchResults.size());
+
+            return switch (effectiveSortBy) {
+                case TOP_COMPONENT -> buildGroupedResponse(query, searchResults, effectiveSortBy, false);
+                case TOP_COMPONENT_ALPHA -> buildGroupedResponse(query, searchResults, effectiveSortBy, true);
+                case SEMANTIC -> buildFlatResponse(query, searchResults, effectiveSortBy, false);
+                case SEMANTIC_ALPHA -> buildFlatResponse(query, searchResults, effectiveSortBy, true);
+            };
+
+        } catch (IllegalStateException e) {
+            if (isEmptyDatabaseError(e)) {
+                log.debug("conceptSearchWithSort on empty/fresh database returned no results for query '{}'", query);
+                return ConceptSearchResponse.empty(query);
+            }
+            log.error("Error in conceptSearchWithSort for query '{}': {}", query, e.getMessage(), e);
+            return ConceptSearchResponse.error(query, e.getMessage());
+        } catch (Exception e) {
+            log.error("Error in conceptSearchWithSort for query '{}': {}", query, e.getMessage(), e);
+            return ConceptSearchResponse.error(query, e.getMessage());
+        }
+    }
+
+    /**
+     * Returns true when the exception indicates a missing kernel concept in the database —
+     * the expected state on a fresh DB that has not had starter data imported yet.
+     * In this case, search should return empty results rather than an error.
+     */
+    private static boolean isEmptyDatabaseError(IllegalStateException e) {
+        return e.getMessage() != null && e.getMessage().startsWith("No entity key found for UUIDs");
+    }
+
+    /**
+     * Builds a flat (semantic) response, sorted by score or alphabetically.
+     */
+    private ConceptSearchResponse buildFlatResponse(String query, List<LatestVersionSearchResult> results,
+            SearchSortOption sortBy, boolean alphabetical) {
+
+        // Sort the results
+        List<LatestVersionSearchResult> sortedResults = new ArrayList<>(results);
+        if (alphabetical) {
+            // Sort alphabetically by matched text
+            sortedResults.sort((r1, r2) -> {
+                String text1 = getPlainText(r1);
+                String text2 = getPlainText(r2);
+                return compareStringsNaturally(text1, text2);
+            });
+        } else {
+            // Sort by score (highest first)
+            sortedResults.sort((r1, r2) -> Float.compare(r2.score(), r1.score()));
+        }
+
+        // Convert to response format
+        List<SemanticSearchResult> semanticResults = sortedResults.stream()
+                .filter(r -> topComponentNid(r).isPresent())
+                .map(this::toSemanticSearchResult)
+                .toList();
+        logLeftOut(query, (int) sortedResults.stream().filter(r -> r.latestVersion().isPresent()).count()
+                - semanticResults.size());
+
+        return ConceptSearchResponse.successFlat(query, sortBy, semanticResults);
+    }
+
+    /**
+     * Builds a grouped (top component) response, sorted by score or alphabetically.
+     */
+    private ConceptSearchResponse buildGroupedResponse(String query, List<LatestVersionSearchResult> results,
+            SearchSortOption sortBy, boolean alphabetical) {
+
+        // Group results by top-level component (concept)
+        Map<Long, List<LatestVersionSearchResult>> groupedByTopNid;
+
+        if (alphabetical) {
+            // Use TreeMap for alphabetical ordering of concepts
+            groupedByTopNid = new TreeMap<>((nid1, nid2) -> {
+                String name1 = getConceptName(nid1);
+                String name2 = getConceptName(nid2);
+                return compareStringsNaturally(name1, name2);
+            });
+        } else {
+            // Use LinkedHashMap to preserve insertion order (by score)
+            groupedByTopNid = new LinkedHashMap<>();
+        }
+
+        // Sort initial results by score for proper grouping
+        List<LatestVersionSearchResult> sortedForGrouping = new ArrayList<>(results);
+        sortedForGrouping.sort((r1, r2) -> Float.compare(r2.score(), r1.score()));
+
+        // Group by top component nid
+        int leftOut = 0;
+        for (LatestVersionSearchResult result : sortedForGrouping) {
+            OptionalLong topNid = topComponentNid(result);
+            if (topNid.isPresent()) {
+                groupedByTopNid.computeIfAbsent(topNid.getAsLong(), k -> new ArrayList<>()).add(result);
+            } else if (result.latestVersion().isPresent()) {
+                leftOut++;
+            }
+        }
+        logLeftOut(query, leftOut);
+
+        // Convert to response format
+        List<GroupedSearchResult> groupedResults = new ArrayList<>();
+        long totalSemanticCount = 0;
+
+        for (Map.Entry<Long, List<LatestVersionSearchResult>> entry : groupedByTopNid.entrySet()) {
+            long topNid = entry.getKey();
+            List<LatestVersionSearchResult> conceptResults = entry.getValue();
+
+            // Sort matches within this concept
+            if (alphabetical) {
+                conceptResults.sort((r1, r2) -> compareStringsNaturally(getPlainText(r1), getPlainText(r2)));
+            } else {
+                conceptResults.sort((r1, r2) -> Float.compare(r2.score(), r1.score()));
+            }
+
+            // Get concept info
+            PublicId conceptPublicId = PrimitiveData.publicId(topNid);
+            String fqn = getConceptName(topNid);
+            boolean active = isConceptActive(topNid);
+            float topScore = conceptResults.isEmpty() ? 0f : conceptResults.get(0).score();
+
+            // Build matching semantics list
+            List<MatchingSemantic> matchingSemantics = conceptResults.stream()
+                    .map(r -> new MatchingSemantic(
+                            semanticPublicId(r),
+                            r.highlightedString(),
+                            getPlainText(r),
+                            r.score(),
+                            r.fieldIndex()))
+                    .toList();
+
+            String preferredName = getConceptPreferredName(topNid);
+            groupedResults.add(new GroupedSearchResult(
+                    conceptPublicId.asUuidList().stream().map(UUID::toString).toList(),
+                    fqn,
+                    preferredName,
+                    highlightName(query, preferredName),
+                    active,
+                    topScore,
+                    matchingSemantics));
+
+            totalSemanticCount += matchingSemantics.size();
+        }
+
+        // If not alphabetical, sort grouped results by their top score
+        if (!alphabetical) {
+            groupedResults.sort((g1, g2) -> Float.compare(g2.topScore(), g1.topScore()));
+        }
+
+        return ConceptSearchResponse.successGrouped(query, sortBy, groupedResults, totalSemanticCount);
+    }
+
+    /** One line per search, not per hit: the hits themselves are logged at DEBUG. */
+    private static void logLeftOut(String query, int leftOut) {
+        if (leftOut > 0) {
+            log.info("Search '{}': left out {} hit(s) referring to components this store does not hold"
+                    + " (DEBUG lists them)", query, leftOut);
+        }
+    }
+
+    /**
+     * The concept a search hit belongs to: the top of the chain of components its semantic
+     * refers to — or empty if that chain cannot be followed, and the hit is left out.
+     *
+     * <p>The chain breaks when a semantic refers to a component this store does not hold — a
+     * comment Komet committed about components it deliberately never sends here (its bootstrap
+     * seeding), or a reference a time-range import brought in without its target. One such hit
+     * used to fail the whole search with "Expected entity to be present but entity was absent".
+     */
+    private OptionalLong topComponentNid(LatestVersionSearchResult result) {
+        if (!result.latestVersion().isPresent()) {
+            return OptionalLong.empty();
+        }
+        var chronology = result.latestVersion().get().chronology();
+        try {
+            return OptionalLong.of(chronology.topEnclosingComponentNid());
+        } catch (IllegalStateException e) {
+            log.debug("Search hit {} left out: it refers to a component this store does not hold ({})",
+                    chronology.publicId().idString(), e.getMessage());
+            return OptionalLong.empty();
+        }
+    }
+
+    /**
+     * Converts a LatestVersionSearchResult to a SemanticSearchResult.
+     */
+    private SemanticSearchResult toSemanticSearchResult(LatestVersionSearchResult result) {
+        long topNid = topComponentNid(result).orElseThrow();
+
+        PublicId conceptPublicId = PrimitiveData.publicId(topNid);
+        String fqn = getConceptName(topNid);
+        String regularName = getConceptRegularName(topNid);
+        boolean active = isConceptActive(topNid);
+
+        return new SemanticSearchResult(
+                conceptPublicId.asUuidList().stream().map(UUID::toString).toList(),
+                fqn,
+                regularName,
+                result.highlightedString(),
+                result.score(),
+                active);
+    }
+
+    /**
+     * Gets the plain text from a search result by stripping HTML tags.
+     */
+    private String getPlainText(LatestVersionSearchResult result) {
+        String highlighted = result.highlightedString();
+        if (highlighted == null) {
+            return "";
+        }
+        // Remove HTML bold tags and normalize whitespace
+        return highlighted
+                .replaceAll("<B>", "")
+                .replaceAll("</B>", "")
+                .replaceAll("<b>", "")
+                .replaceAll("</b>", "")
+                .replaceAll("\\s+", " ")
+                .trim();
+    }
+
+    /**
+     * Gets the fully qualified name for a concept by nid.
+     */
+    private String getConceptName(long nid) {
+        return getConceptName(nid, Calculators.View.Default());
+    }
+
+    /**
+     * The fully qualified name of a component, falling back to
+     * {@link #getDescriptionForNid(int, ViewCalculatorWithCache) its description}.
+     *
+     * @param nid  the component's nid in this store
+     * @param calc the view calculator that selects the description
+     * @return the fully qualified name, else another description, else the component's first
+     *         UUID; never a nid
+     */
+    private String getConceptName(long nid, ViewCalculatorWithCache calc) {
+        try {
+            Optional<String> fullyQualifiedName = calc.languageCalculator().getFullyQualifiedNameText(nid);
+            if (fullyQualifiedName.isPresent() && !fullyQualifiedName.get().isBlank()) {
+                return fullyQualifiedName.get();
+            }
+        } catch (Exception e) {
+            log.debug("Fully qualified name lookup failed for {}: {}", identifierFor(nid), e.getMessage());
+        }
+        return getDescriptionForNid(nid, calc);
+    }
+
+    /**
+     * The public ID of the semantic a search result matched, as UUID strings.
+     *
+     * <p>Sent so a remote client can identify the semantic behind the matched text.
+     * It is the only identifier of the semantic in a result: a nid is local to this
+     * data store and means nothing to a caller holding a different one, so none is sent
+     * ({@code IKE-Network/ike-issues#1182}).
+     *
+     * @return the semantic's UUIDs, or null when the latest version is absent
+     */
+    private List<String> semanticPublicId(LatestVersionSearchResult result) {
+        if (result.latestVersion() == null || result.latestVersion().isAbsent()) {
+            return null;
+        }
+        return result.latestVersion().get().publicId()
+                .asUuidList().stream().map(UUID::toString).toList();
+    }
+
+    /**
+     * The concept's preferred description, resolved the same way a local calculator would
+     * for a search result label — via the language coordinate's description type and
+     * dialect preferences, rather than forcing the fully qualified name.
+     *
+     * <p>Remote clients cannot do this themselves: nids are local to a data store, so a
+     * client holding only a public ID has nothing to resolve descriptions against.
+     *
+     * <p>When no description resolves there is no preferred name, and the result is null: the
+     * caller's label then falls back to the fully qualified name, which names an undescribed
+     * concept by its UUID.
+     */
+    private String getConceptPreferredName(long nid) {
+        return getConceptPreferredName(nid, Calculators.View.Default());
+    }
+
+    private String getConceptPreferredName(long nid, ViewCalculatorWithCache calc) {
+        try {
+            return calc.languageCalculator().getDescriptionText(nid)
+                    .filter(text -> !text.isBlank())
+                    .orElse(null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Marks the parts of {@code name} matching {@code query} with {@code <B>...</B>}, using
+     * the same analyzer and markers the index uses for hit snippets, so a client renders a
+     * concept title and its matched descriptions through one highlight parser.
+     *
+     * @return the marked-up name, or null when there is nothing to mark or highlighting failed
+     */
+    private String highlightName(String query, String name) {
+        if (query == null || query.isBlank() || name == null || name.isBlank()) {
+            return null;
+        }
+        try {
+            return Calculators.View.Default().highlight(query, name);
+        } catch (Exception e) {
+            log.debug("Title highlight failed for query '{}'; sending the plain name", query, e);
+            return null;
+        }
+    }
+
+    /**
+     * Gets the regular/preferred name for a concept by nid.
+     */
+    private String getConceptRegularName(long nid) {
+        return getConceptRegularName(nid, Calculators.View.Default());
+    }
+
+    private String getConceptRegularName(long nid, ViewCalculatorWithCache calc) {
+        try {
+            return calc.languageCalculator()
+                    .getRegularDescriptionText(nid)
+                    .orElse(null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Checks if a concept is active.
+     */
+    private boolean isConceptActive(long nid) {
+        return isConceptActive(nid, Calculators.View.Default());
+    }
+
+    private boolean isConceptActive(long nid, ViewCalculatorWithCache calc) {
+        var latest = calc.latest(nid);
+        return latest.isPresent() && latest.get().active();
+    }
+
+    /**
+     * Natural order string comparison that handles numbers intelligently.
+     * e.g., "Item 2" comes before "Item 10".
+     */
+    private int compareStringsNaturally(String s1, String s2) {
+        if (s1 == null && s2 == null) return 0;
+        if (s1 == null) return -1;
+        if (s2 == null) return 1;
+        return s1.compareToIgnoreCase(s2);
+    }
+
+    @Override
+    public TinkarSearchQueryResponse getEntity(String conceptId) {
+        try {
+            PublicId publicId = primitive.getPublicId(conceptId);
+            TinkarSearchResult result = publicIdToSearchResult(publicId);
+            return buildSuccessResponse(conceptId, List.of(result));
+        } catch (Exception e) {
+            return buildErrorResponse(conceptId, e.getMessage());
+        }
+    }
+
+    @Override
+    public TinkarSearchQueryResponse getChildConcepts(String conceptId) {
+        try {
+            PublicId parentConceptId = primitive.getPublicId(conceptId);
+            List<PublicId> children = primitive.childrenOf(parentConceptId);
+            List<TinkarSearchResult> results = children.stream()
+                    .map(this::publicIdToSearchResult)
+                    .toList();
+
+            return buildSuccessResponse(conceptId, results);
+        } catch (Exception e) {
+            return buildErrorResponse(conceptId, e.getMessage());
+        }
+    }
+
+    @Override
+    public TinkarSearchQueryResponse getDescendantConcepts(String conceptId) {
+        try {
+            PublicId parentConceptId = primitive.getPublicId(conceptId);
+            List<PublicId> descendants = primitive.descendantsOf(parentConceptId);
+            List<TinkarSearchResult> results = descendants.stream()
+                    .map(this::publicIdToSearchResult)
+                    .toList();
+
+            return buildSuccessResponse(conceptId, results);
+        } catch (Exception e) {
+            return buildErrorResponse(conceptId, e.getMessage());
+        }
+    }
+
+    @Override
+    public TinkarSearchQueryResponse getChildConcepts(String conceptId, ViewCalculatorWithCache viewCalculator) {
+        ViewCalculatorWithCache calc = resolveCalculator(viewCalculator);
+        try {
+            PublicId parentConceptId = primitive.getPublicId(conceptId);
+            EntityProxy.Concept concept = EntityProxy.Concept.make(parentConceptId);
+            List<TinkarSearchResult> results = new ArrayList<>();
+            calc.navigationCalculator().childrenOf(concept)
+                    .forEach(childNid -> results.add(publicIdToSearchResult(PrimitiveData.publicId(childNid), calc)));
+            return buildSuccessResponse(conceptId, results);
+        } catch (Exception e) {
+            return buildErrorResponse(conceptId, e.getMessage());
+        }
+    }
+
+    @Override
+    public TinkarSearchQueryResponse getDescendantConcepts(String conceptId, ViewCalculatorWithCache viewCalculator) {
+        ViewCalculatorWithCache calc = resolveCalculator(viewCalculator);
+        try {
+            PublicId parentConceptId = primitive.getPublicId(conceptId);
+            EntityProxy.Concept concept = EntityProxy.Concept.make(parentConceptId);
+            List<TinkarSearchResult> results = new ArrayList<>();
+            calc.navigationCalculator().descendentsOf(concept)
+                    .forEach(descNid -> results.add(publicIdToSearchResult(PrimitiveData.publicId(descNid), calc)));
+            return buildSuccessResponse(conceptId, results);
+        } catch (Exception e) {
+            return buildErrorResponse(conceptId, e.getMessage());
+        }
+    }
+
+    @Override
+    public TinkarSearchQueryResponse getLIDRRecordConceptsFromTestKit(String conceptId) {
+        try {
+            PublicId testKitConceptId = primitive.getPublicId(conceptId);
+            List<PublicId> lidrRecords = primitive.getLidrRecordSemanticsFromTestKit(testKitConceptId);
+            List<TinkarSearchResult> results = lidrRecords.stream()
+                    .map(this::publicIdToSearchResult)
+                    .toList();
+
+            return buildSuccessResponse(conceptId, results);
+        } catch (Exception e) {
+            return buildErrorResponse(conceptId, e.getMessage());
+        }
+    }
+
+    @Override
+    public TinkarSearchQueryResponse getResultConformanceConceptsFromLIDRRecord(String conceptId) {
+        try {
+            PublicId lidrRecordConceptId = primitive.getPublicId(conceptId);
+            List<PublicId> resultConformances = primitive.getResultConformancesFromLidrRecord(lidrRecordConceptId);
+            List<TinkarSearchResult> results = resultConformances.stream()
+                    .map(this::publicIdToSearchResult)
+                    .toList();
+
+            return buildSuccessResponse(conceptId, results);
+        } catch (Exception e) {
+            return buildErrorResponse(conceptId, e.getMessage());
+        }
+    }
+
+    @Override
+    public TinkarSearchQueryResponse getAllowedResultConceptsFromResultConformance(String conceptId) {
+        try {
+            PublicId resultConformanceConceptId = primitive.getPublicId(conceptId);
+            List<PublicId> allowedResults = primitive.getAllowedResultsFromResultConformance(resultConformanceConceptId);
+            List<TinkarSearchResult> results = allowedResults.stream()
+                    .map(this::publicIdToSearchResult)
+                    .toList();
+
+            return buildSuccessResponse(conceptId, results);
+        } catch (Exception e) {
+            return buildErrorResponse(conceptId, e.getMessage());
+        }
+    }
+
+    @Override
+    public String rebuildSearchIndex() {
+        log.info("Rebuilding Lucene search index...");
+        try {
+            CompletableFuture<Void> future = PrimitiveData.get().recreateLuceneIndex();
+            log.info("Lucene index rebuild started asynchronously");
+
+            future.whenComplete((result, throwable) -> {
+                if (throwable != null) {
+                    log.error("Error rebuilding Lucene index: {}", throwable.getMessage(), throwable);
+                } else {
+                    log.info("Lucene index rebuild completed successfully");
+                }
+            });
+
+            return "Lucene search index rebuild started. This operation may take several minutes. Check logs for completion status.";
+        } catch (Exception e) {
+            log.error("Failed to start Lucene index rebuild: {}", e.getMessage(), e);
+            return "Failed to start Lucene index rebuild: " + e.getMessage();
+        }
+    }
+
+    private TinkarSearchQueryResponse buildSuccessResponse(String query, List<TinkarSearchResult> results) {
+        return TinkarSearchQueryResponse.newBuilder()
+                .setQuery(query != null ? query : "")
+                .setTotalCount(results.size())
+                .addAllResults(results)
+                .setSuccess(true)
+                .setErrorMessage("")
+                .setCreatedAt(System.currentTimeMillis())
+                .build();
+    }
+
+    private TinkarSearchQueryResponse buildErrorResponse(String query, String errorMessage) {
+        return TinkarSearchQueryResponse.newBuilder()
+                .setQuery(query != null ? query : "")
+                .setTotalCount(0)
+                .setSuccess(false)
+                .setErrorMessage(errorMessage != null ? errorMessage : "Unknown error")
+                .setCreatedAt(System.currentTimeMillis())
+                .build();
+    }
+
+    private TinkarSearchResult publicIdToSearchResult(PublicId publicId) {
+        ViewCalculatorWithCache calc = null;
+        try {
+            calc = Calculators.View.Default();
+        } catch (IllegalStateException e) {
+            // Fresh DB: some kernel UUID stubs are missing; descriptions will be empty
+            log.debug("ViewCalculator init failed (fresh DB?): {}", e.getMessage());
+        }
+        return publicIdToSearchResult(publicId, calc);
+    }
+
+    private TinkarSearchResult publicIdToSearchResult(PublicId publicId, ViewCalculatorWithCache calc) {
+        dev.ikm.tinkar.schema.PublicId protoPublicId = protoPublicId(publicId);
+
+        long nid;
+        try {
+            nid = EntityService.get().nidForPublicId(publicId);
+        } catch (Exception e) {
+            // Entity exists in the NID store (found via iteration) but its UUID is not in
+            // the reverse UUID→NID index (data integrity gap in the dataset).
+            // Return a minimal result so the caller gets the PublicId rather than failing.
+            log.warn("UUID not in NID index, returning minimal result for: {} ({})", publicId, e.getMessage());
+            return TinkarSearchResult.newBuilder()
+                    .setPublicId(protoPublicId)
+                    .setDescriptions(TinkarConceptDescriptions.newBuilder().build())
+                    .setStamp(StampVersion.newBuilder().build())
+                    .build();
+        }
+
+        // Build descriptions — guard against missing kernel concepts on a fresh DB.
+        // calc may be null when ViewCalculator initialization failed (missing UUID stubs).
+        // If the language calculator throws (e.g. DESCRIPTION_PATTERN stub has no field
+        // definitions so indexOfMeaning() returns -1), fall back to direct semantic scan.
+        String fullyQualifiedName = "";
+        String regularName = "";
+        boolean descLookupSucceeded = false;
+        if (calc != null) {
+            try {
+                var lc = calc.languageCalculator();
+                fullyQualifiedName = lc.getFullyQualifiedNameText(nid).orElse("");
+                regularName = lc.getRegularDescriptionText(nid).orElse("");
+                descLookupSucceeded = true;
+            } catch (Exception e) {
+                log.debug("Description lookup failed for nid {} (may be fresh DB with no starter data): {}", nid, e.getMessage());
+            }
+        }
+        if (!descLookupSucceeded) {
+            // Fallback: scan the concept's semantics and return the first String field value
+            // found (that's the description text). This works without pattern field definitions.
+            fullyQualifiedName = getFallbackDescriptionText(nid);
+            regularName = fullyQualifiedName;
+        }
+
+        TinkarConceptDescriptions descriptions = TinkarConceptDescriptions.newBuilder()
+                .setFullyQualifiedName(fullyQualifiedName)
+                .setRegularName(regularName)
+                .setDefinition(fullyQualifiedName)
+                .build();
+
+        // Build StampVersion
+        StampVersion stamp = buildStampVersion(nid);
+
+        return TinkarSearchResult.newBuilder()
+                .setPublicId(protoPublicId)
+                .setDescriptions(descriptions)
+                .setStamp(stamp)
+                .build();
+    }
+
+    private StampVersion buildStampVersion(long nid) {
+        StampVersion.Builder stampBuilder = StampVersion.newBuilder();
+
+        try {
+            Entity<?> entity = EntityHandle.get(nid).orNull();
+            if (entity != null && !entity.versions().isEmpty()) {
+                long stampNid = entity.versions().get(0).stampNid();
+                StampEntity<?> stampEntity = EntityService.get().getStampFast(stampNid);
+                if (stampEntity != null) {
+                    setPublicIdIfPresent(stampBuilder, stampEntity.stateNid(), "status");
+                    setPublicIdIfPresent(stampBuilder, stampEntity.authorNid(), "author");
+                    setPublicIdIfPresent(stampBuilder, stampEntity.moduleNid(), "module");
+                    setPublicIdIfPresent(stampBuilder, stampEntity.pathNid(), "path");
+                    stampBuilder.setTime(stampEntity.time());
+                }
+            }
+        } catch (Exception ex) {
+            log.warn("Failed to get STAMP data for nid {}: {}", nid, ex.getMessage());
+        }
+
+        return stampBuilder.build();
+    }
+
+    private void setPublicIdIfPresent(StampVersion.Builder stampBuilder, long nid, String fieldType) {
+        try {
+            Entity<?> entity = EntityHandle.get(nid).orNull();
+            if (entity != null && entity.publicId() != null) {
+                dev.ikm.tinkar.schema.PublicId protoPublicId = protoPublicId(entity.publicId());
+
+                switch (fieldType) {
+                    case "status" -> stampBuilder.setStatusPublicId(protoPublicId);
+                    case "author" -> stampBuilder.setAuthorPublicId(protoPublicId);
+                    case "module" -> stampBuilder.setModulePublicId(protoPublicId);
+                    case "path" -> stampBuilder.setPathPublicId(protoPublicId);
+                    default -> log.warn("Unknown fieldType '{}' for nid {}", fieldType, nid);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Failed to get {} public ID for nid {}: {}", fieldType, nid, e.getMessage());
+        }
+    }
+
+    @Override
+    public ChangeHistoryResponse getChangeHistory(String entityId) {
+        return getChangeHistory(entityId, null);
+    }
+
+    @Override
+    public ChangeHistoryResponse getChangeHistory(String entityId, ViewCalculatorWithCache viewCalculator) {
+        ViewCalculatorWithCache calc = resolveCalculator(viewCalculator);
+        try {
+            PublicId publicId = primitive.getPublicId(entityId);
+            long nid = EntityService.get().nidForPublicId(publicId);
+
+            // Get the entity description — use safe helper that handles restricted states
+            String entityDescription = getDescriptionForNid(nid, calc);
+
+            // Get change chronology using the stamp calculator
+            ChangeChronology changeChronology = calc.stampCalculator()
+                    .changeChronology(nid);
+
+            // Convert to DTO
+            List<VersionChange> versionChanges = convertChangeChronologyToDto(changeChronology, calc);
+
+            return ChangeHistoryResponse.success(entityId, entityDescription, versionChanges);
+        } catch (Exception e) {
+            log.error("Failed to get change history for entity {}: {}", entityId, e.getMessage(), e);
+            return ChangeHistoryResponse.error(entityId, e.getMessage());
+        }
+    }
+
+    @Override
+    public ChangeHistoryResponse createSampleChange(String conceptId, String comment) {
+        try {
+            PublicId conceptPublicId = primitive.getPublicId(conceptId);
+            long conceptNid = EntityService.get().nidForPublicId(conceptPublicId);
+
+            // Get the entity description for context
+            String conceptDescription = Calculators.View.Default()
+                    .languageCalculator()
+                    .getRegularDescriptionText(conceptNid)
+                    .orElse("Unknown concept");
+
+            // Create a new semantic (comment) attached to the concept
+            UUID semanticUuid = UUID.randomUUID();
+            long currentTime = System.currentTimeMillis();
+
+            // Create a transaction for the change
+            Transaction transaction = Transaction.make("Add comment to " + conceptDescription);
+
+            try {
+                // Get STAMP for this transaction (Active state, current time, user, module, path)
+                StampEntity<?> stamp = transaction.getStamp(
+                        dev.ikm.tinkar.terms.State.ACTIVE,
+                        currentTime,
+                        KernelTerm.USER.nid(),
+                        KernelTerm.SOLOR_OVERLAY_MODULE.nid(),
+                        KernelTerm.DEVELOPMENT_PATH.nid()
+                );
+
+                // Build the semantic record with the comment pattern
+                // Comment pattern has one field: the comment text
+                SemanticRecord semanticRecord = SemanticRecord.build(
+                        semanticUuid,
+                        KernelTerm.COMMENT_PATTERN.nid(),
+                        conceptNid,
+                        stamp.versions().get(0),
+                        Lists.immutable.of(comment)
+                );
+
+                // Persist the semantic record to the entity store
+                EntityService.get().putEntity(semanticRecord);
+
+                // Add to transaction and commit
+                transaction.addComponent(semanticRecord);
+                transaction.commit();
+
+                // Note: Changes are held in memory until saveChanges() is called.
+                // This allows for a review process before persisting to disk.
+
+                log.info("Created comment semantic {} on concept {} with comment: {}",
+                        semanticUuid, conceptId, comment);
+
+                // Build the response directly from the data we just created
+                // (The newly created semantic may not be immediately queryable)
+                return buildChangeResponseForNewSemantic(
+                        semanticUuid.toString(),
+                        conceptDescription,
+                        comment,
+                        stamp,
+                        currentTime
+                );
+
+            } catch (Exception e) {
+                // The commit is inside the try, so this can run after it; a committed
+                // transaction is not canceled (IKE-Network/ike-issues#1243).
+                if (transaction.isOpen()) {
+                    transaction.cancel();
+                }
+                throw e;
+            }
+
+        } catch (Exception e) {
+            log.error("Failed to create sample change for concept {}: {}", conceptId, e.getMessage(), e);
+            return ChangeHistoryResponse.error(conceptId, e.getMessage());
+        }
+    }
+
+    private ChangeHistoryResponse buildChangeResponseForNewSemantic(
+            String semanticId,
+            String conceptDescription,
+            String comment,
+            StampEntity<?> stamp,
+            long time) {
+
+        // Build STAMP info from the stamp entity
+        String status = getDescriptionForNid(stamp.stateNid());
+        String author = getDescriptionForNid(stamp.authorNid());
+        String module = getDescriptionForNid(stamp.moduleNid());
+        String path = getDescriptionForNid(stamp.pathNid());
+        String formattedTime = formatTimestamp(time);
+
+        StampInfo stampInfo = new StampInfo(status, author, module, path, time, formattedTime);
+
+        // Build field change for the comment field (newly added)
+        String patternName = getDescriptionForNid(KernelTerm.COMMENT_PATTERN.nid());
+        FieldChange commentFieldChange = new FieldChange(
+                patternName + " [0]",
+                0,
+                null,  // No prior value - this is a new semantic
+                comment,
+                "ADDED"
+        );
+
+        VersionChange versionChange = new VersionChange(stampInfo, List.of(commentFieldChange));
+
+        String entityDescription = "Comment on: " + conceptDescription;
+
+        return new ChangeHistoryResponse(
+                semanticId,
+                entityDescription,
+                1,
+                List.of(versionChange),
+                true,
+                null,
+                System.currentTimeMillis()
+        );
+    }
+
+    private List<VersionChange> convertChangeChronologyToDto(ChangeChronology changeChronology, ViewCalculatorWithCache calc) {
+        List<VersionChange> versionChanges = new ArrayList<>();
+
+        for (VersionChangeRecord versionChange : changeChronology.changeRecords()) {
+            StampInfo stampInfo = buildStampInfo(versionChange.stampNid(), calc);
+            List<FieldChange> fieldChanges = convertFieldChanges(versionChange.changes(), calc);
+            versionChanges.add(new VersionChange(stampInfo, fieldChanges));
+        }
+
+        return versionChanges;
+    }
+
+    private StampInfo buildStampInfo(long stampNid, ViewCalculatorWithCache calc) {
+        try {
+            StampEntity<?> stampEntity = EntityService.get().getStampFast(stampNid);
+            if (stampEntity == null) {
+                return new StampInfo(null, null, null, null, null, null);
+            }
+
+            // Stamp component NIDs (status/author/module/path) are fixed system concepts
+            // that don't have dialect-specific descriptions — use the default calculator.
+            String status = getDescriptionForNid(stampEntity.stateNid());
+            String author = getDescriptionForNid(stampEntity.authorNid());
+            String module = getDescriptionForNid(stampEntity.moduleNid());
+            String path = getDescriptionForNid(stampEntity.pathNid());
+            long time = stampEntity.time();
+            String formattedTime = formatTimestamp(time);
+
+            return new StampInfo(status, author, module, path, time, formattedTime);
+        } catch (Exception e) {
+            log.warn("Failed to build STAMP info for stampNid {}: {}", stampNid, e.getMessage());
+            return new StampInfo(null, null, null, null, null, null);
+        }
+    }
+
+    /**
+     * STAMP of a concept's latest version, or null if it cannot be resolved.
+     *
+     * <p>Latest by stamp time rather than by position: version order in the chronology is not
+     * guaranteed to put the newest last.
+     */
+    private ConceptSemanticsResponse.StampInfo conceptStampInfo(
+            String conceptId, ViewCalculatorWithCache viewCalculator) {
+        try {
+            PublicId publicId = primitive.getPublicId(conceptId);
+            long nid = EntityService.get().nidForPublicId(publicId);
+            Entity<?> entity = EntityHandle.get(nid).orNull();
+            if (entity == null || entity.versions().isEmpty()) {
+                return null;
+            }
+
+            long latestStampNid = -1;
+            long latestTime = Long.MIN_VALUE;
+            for (EntityVersion version : entity.versions()) {
+                StampEntity<?> stamp = EntityService.get().getStampFast(version.stampNid());
+                if (stamp != null && stamp.time() >= latestTime) {
+                    latestTime = stamp.time();
+                    latestStampNid = version.stampNid();
+                }
+            }
+            if (latestStampNid == -1) {
+                return null;
+            }
+
+            StampInfo stamp = buildStampInfo(latestStampNid, viewCalculator);
+            return new ConceptSemanticsResponse.StampInfo(
+                    stamp.status(), stamp.author(), stamp.module(),
+                    stamp.path(), stamp.time(), stamp.formattedTime());
+        } catch (Exception e) {
+            log.debug("Could not resolve the concept STAMP for {}: {}", conceptId, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * A wire public id carrying every UUID of a component's public id. Any of them identifies the
+     * component, so none is dropped.
+     *
+     * @param publicId the component's public id
+     * @return the wire public id, listing every UUID
+     */
+    private static dev.ikm.tinkar.schema.PublicId protoPublicId(PublicId publicId) {
+        return SchemaIds.toSchema(publicId);
+    }
+
+    /**
+     * The one UUID that stands for a component in response text: the least of its public id's
+     * UUIDs ({@link PublicId#leastUuid()}). Any of them resolves the component; the least is
+     * chosen so the text does not depend on the order the store lists them in.
+     *
+     * @param nid the component's nid in this store
+     * @return the least UUID, or empty when the store has no public id for the nid
+     */
+    private static Optional<UUID> leastUuidFor(long nid) {
+        try {
+            PublicId publicId = PrimitiveData.publicId(nid);
+            if (publicId == null || publicId.uuidCount() == 0) {
+                return Optional.empty();
+            }
+            return Optional.of(publicId.leastUuid());
+        } catch (RuntimeException unresolvable) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * The identifier written for a component in response text: the least of its UUIDs.
+     *
+     * <p>A nid is local to this store. The caller holds another store, or none, and response
+     * text is kept — in gRPC mode it is what the assistant's tools return — so a component is
+     * identified in text by its public id only ({@code IKE-Network/ike-issues#1177}). These are
+     * the rules the assistant follows for a local store ({@code IKE-Network/ike-issues#1170}),
+     * so a component reads the same in both modes.
+     *
+     * @param nid the component's nid in this store
+     * @return the least UUID as a string, or {@link #UNIDENTIFIED} when the store has no public
+     *         id for the nid; never a nid
+     */
+    static String identifierFor(long nid) {
+        return leastUuidFor(nid).map(UUID::toString).orElse(UNIDENTIFIED);
+    }
+
+    /**
+     * The name written for a component under the default view. The parts of a stamp and the
+     * values of semantic fields are named this way, whatever view the request names.
+     *
+     * @param nid the component's nid in this store
+     * @return the description; when none resolves, the {@link #identifierFor(int) identifier};
+     *         never a nid
+     */
+    private String getDescriptionForNid(long nid) {
+        try {
+            var lc = Calculators.View.Default().languageCalculator();
+            String desc = lc.getRegularDescriptionText(nid)
+                    .or(() -> lc.getFullyQualifiedNameText(nid))
+                    .orElse(null);
+            if (desc != null) return desc;
+        } catch (Exception ignored) {}
+        String raw = getFallbackDescriptionText(nid);
+        return raw.isBlank() ? identifierFor(nid) : raw;
+    }
+
+    /**
+     * The name written for a component under the request's view.
+     *
+     * @param nid  the component's nid in this store
+     * @param calc the view calculator that selects the description
+     * @return the description; for a semantic, which has none of its own, what the semantic is;
+     *         when nothing resolves, the {@link #identifierFor(int) identifier}; never a nid
+     */
+    private String getDescriptionForNid(long nid, ViewCalculatorWithCache calc) {
+        // First try the provided calculator's language coordinate — this works on a full DB
+        // where patterns have field definitions and returns the dialect-preferred description.
+        try {
+            String desc = calc.languageCalculator().getRegularDescriptionText(nid)
+                    .or(() -> calc.languageCalculator().getFullyQualifiedNameText(nid))
+                    .orElse(null);
+            if (desc != null) return desc;
+        } catch (Exception e) {
+            log.debug("Language calculator failed for nid {}, trying hardcoded fallback: {}", nid, e.getMessage());
+        }
+        // Hardcoded-index fallback: works on a fresh DB where PatternChronology stubs have
+        // no field definitions (so indexForMeaning() fails).  Reads field[1]=text, field[3]=type
+        // and walks dialect-acceptability semantics to honour the calc's language coordinate.
+        String langAware = getLanguageAwareFallbackDescription(nid, calc);
+        if (!langAware.isBlank()) return langAware;
+        // Final resort: first string in any semantic (no language awareness)
+        String raw = getFallbackDescriptionText(nid);
+        if (!raw.isBlank()) {
+            return raw;
+        }
+        // A semantic instance has no description semantics of its own, so every lookup above
+        // fails for one. Describe what it IS; a component that is not a semantic is named by
+        // its UUID.
+        String semanticDescription = describeSemanticEntity(nid, calc);
+        return semanticDescription != null ? semanticDescription : identifierFor(nid);
+    }
+
+    /**
+     * A readable description for a semantic instance, rendered as
+     * {@code "<Pattern> semantic on <referenced component>"} — e.g.
+     * {@code "Test Performed Pattern semantic on BioFire® Respiratory Panel 2.1"}. Used as the
+     * last-resort description so a caller that passed a semantic's public ID sees what the
+     * entity is instead of a bare identifier.
+     *
+     * <p>When the referenced component is itself a semantic, only its pattern name is used —
+     * deliberately not a recursive description — so a semantic-on-semantic chain (or a cycle)
+     * cannot recurse without bound.
+     *
+     * @param nid  the entity nid
+     * @param calc the view calculator used to resolve pattern and component names
+     * @return the description, or {@code null} when {@code nid} is not a semantic
+     */
+    private String describeSemanticEntity(long nid, ViewCalculatorWithCache calc) {
+        try {
+            Entity<?> entity = EntityHandle.get(nid).orNull();
+            if (!(entity instanceof SemanticEntity<?> semantic)) {
+                return null;
+            }
+            String patternName = getDescriptionForNid(semantic.patternNid(), calc);
+            long referencedNid = semantic.referencedComponentNid();
+            Entity<?> referenced = EntityHandle.get(referencedNid).orNull();
+            String referencedName;
+            if (referenced instanceof SemanticEntity<?> referencedSemantic) {
+                referencedName = getDescriptionForNid(referencedSemantic.patternNid(), calc) + " semantic";
+            } else {
+                referencedName = getDescriptionForNid(referencedNid, calc);
+            }
+            return patternName + " semantic on " + referencedName;
+        } catch (Exception e) {
+            log.debug("Could not describe semantic for nid {}: {}", nid, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Language-coordinate-aware description lookup using hardcoded field indices.
+     * Used when {@code LanguageCalculator} fails because PatternChronology stubs lack
+     * field definitions (e.g. fresh DB with only bootstrap changesets loaded).
+     *
+     * <p>Field layout assumed for DESCRIPTION_PATTERN semantics:
+     * <pre>[0] language  [1] text  [2] case significance  [3] description type</pre>
+     *
+     * <p>Dialect acceptability semantics (attached to the description semantic):
+     * <pre>[0] acceptability concept (PREFERRED or ACCEPTABLE)</pre>
+     */
+    private String getLanguageAwareFallbackDescription(long nid, ViewCalculatorWithCache calc) {
+        try {
+            var langCoords = calc.languageCoordinateList();
+            LongIdList dialectPreference = langCoords.isEmpty()
+                    ? LongIds.list.empty()
+                    : langCoords.get(0).dialectPatternPreferenceNidList();
+            long descPatternNid = KernelTerm.DESCRIPTION_PATTERN.nid();
+            long regularNameNid = KernelTerm.REGULAR_NAME_DESCRIPTION_TYPE.nid();
+            long fqnNid         = KernelTerm.FULLY_QUALIFIED_NAME_DESCRIPTION_TYPE.nid();
+            long preferredNid   = KernelTerm.PREFERRED.nid();
+
+            String fqnCandidate = null;
+            // key = position in dialectPreference list (lower = more preferred), value = text
+            TreeMap<Integer, String> dialectMatches = new TreeMap<>();
+
+            for (SemanticEntity<SemanticEntityVersion> semantic : EntityService.get().semanticsForComponent(nid).toList()) {
+                if (semantic.versions().isEmpty()) continue;
+                if (semantic.patternNid() != descPatternNid) continue;
+                var version = semantic.versions().get(0);
+                var fields = version.fieldValues();  // ImmutableList<Object>
+                if (fields.size() < 4) continue;
+
+                if (!(fields.get(1) instanceof String text) || text.isBlank()) continue;
+                Object typeField = fields.get(3);
+                long typeNid;
+                if (typeField instanceof PublicId typePid) {
+                    typeNid = EntityService.get().nidForPublicId(typePid);
+                } else {
+                    continue;
+                }
+
+                if (typeNid == fqnNid) {
+                    fqnCandidate = text;
+                    continue;
+                }
+                if (typeNid != regularNameNid) continue;
+
+                // Check dialect acceptability semantics attached to this description semantic
+                for (SemanticEntity<SemanticEntityVersion> dSem : EntityService.get().semanticsForComponent(semantic.nid()).toList()) {
+                    if (dSem.versions().isEmpty()) continue;
+                    long dialectPatNid = dSem.patternNid();
+                    // manual indexOf since LongIdList has no indexOf method
+                    int priority = -1;
+                    for (int i = 0; i < dialectPreference.size(); i++) {
+                        if (dialectPreference.get(i) == dialectPatNid) { priority = i; break; }
+                    }
+                    if (priority < 0) continue;
+                    var dVer = (SemanticEntityVersion) dSem.versions().get(0);
+                    var dFields = dVer.fieldValues();
+                    if (dFields.isEmpty()) continue;
+                    Object accField = dFields.get(0);
+                    long accNid;
+                    if (accField instanceof PublicId accPid) {
+                        accNid = EntityService.get().nidForPublicId(accPid);
+                    } else {
+                        continue;
+                    }
+                    if (accNid == preferredNid) {
+                        dialectMatches.putIfAbsent(priority, text);
+                    }
+                }
+            }
+            if (!dialectMatches.isEmpty()) return dialectMatches.firstEntry().getValue();
+            if (fqnCandidate != null) return fqnCandidate;
+        } catch (Exception e) {
+            log.debug("Language-aware fallback failed for nid {}: {}", nid, e.getMessage());
+        }
+        return "";
+    }
+
+    /**
+     * Fallback description lookup that does not require pattern field definitions.
+     * Scans all semantics for the concept and returns the first non-blank String field
+     * value found — on a standard Tinkar description semantic this is the text at field[1].
+     * Used when the language calculator fails (e.g. on a fresh DB where the
+     * DESCRIPTION_PATTERN stub has no FieldDefinitions, causing indexOfMeaning() to return -1).
+     */
+    private String getFallbackDescriptionText(long nid) {
+        try {
+            for (SemanticEntity<SemanticEntityVersion> semantic : EntityService.get().semanticsForComponent(nid).toList()) {
+                if (semantic.versions().isEmpty()) continue;
+                SemanticEntityVersion version = semantic.versions().get(0);
+                for (Object field : version.fieldValues()) {
+                    if (field instanceof String text && !text.isBlank()) {
+                        return text;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Fallback description lookup failed for nid {}: {}", nid, e.getMessage());
+        }
+        return "";
+    }
+
+    private String formatTimestamp(long epochMillis) {
+        if (epochMillis == Long.MIN_VALUE || epochMillis == Long.MAX_VALUE) {
+            return "N/A";
+        }
+        return DateTimeFormatter.ISO_LOCAL_DATE_TIME
+                .withZone(ZoneId.systemDefault())
+                .format(Instant.ofEpochMilli(epochMillis));
+    }
+
+    private List<FieldChange> convertFieldChanges(Iterable<FieldChangeRecord> fieldChangeRecords, ViewCalculatorWithCache calc) {
+        List<FieldChange> fieldChanges = new ArrayList<>();
+
+        for (FieldChangeRecord fieldChange : fieldChangeRecords) {
+            String fieldName = determineFieldName(fieldChange, calc);
+            Integer fieldIndex = null;
+            if (fieldChange.currentValue() != null) {
+                fieldIndex = fieldChange.currentValue().indexInPattern();
+            } else if (fieldChange.priorValue() != null) {
+                fieldIndex = fieldChange.priorValue().indexInPattern();
+            }
+
+            String priorValue = fieldChange.priorValue() != null
+                    ? formatFieldValue(fieldChange.priorValue().value(), calc)
+                    : null;
+            String currentValue = fieldChange.currentValue() != null
+                    ? formatFieldValue(fieldChange.currentValue().value(), calc)
+                    : null;
+
+            String changeType = determineChangeType(priorValue, currentValue);
+
+            fieldChanges.add(new FieldChange(fieldName, fieldIndex, priorValue, currentValue, changeType));
+        }
+
+        return fieldChanges;
+    }
+
+    private String determineFieldName(FieldChangeRecord fieldChange, ViewCalculatorWithCache calc) {
+        // Try to get a meaningful name from the pattern
+        long patternNid = fieldChange.currentValue() != null
+                ? fieldChange.currentValue().patternNid()
+                : (fieldChange.priorValue() != null ? fieldChange.priorValue().patternNid() : 0);
+
+        if (patternNid != 0) {
+            try {
+                String patternName = calc.languageCalculator()
+                        .getRegularDescriptionText(patternNid)
+                        .orElse(null);
+                if (patternName != null) {
+                    int index = fieldChange.currentValue() != null
+                            ? fieldChange.currentValue().indexInPattern()
+                            : fieldChange.priorValue().indexInPattern();
+                    return patternName + " [" + index + "]";
+                }
+            } catch (Exception e) {
+                // Fall through to default
+            }
+        }
+        return "Field";
+    }
+
+    /**
+     * The text of a semantic field value.
+     *
+     * <p>A component is its name. A list or set of components is a list of names, each with an
+     * explicitly typed identifier. A definition tree or a vertex is written with names only,
+     * in the layout the assistant writes for a local store. Any other value — a string, a
+     * number, a boolean, an instant — is its own text.
+     *
+     * <p>No value is written with the {@code toString()} of a component, a tree, or a vertex:
+     * each of those writes a nid ({@code IKE-Network/ike-issues#1177}).
+     *
+     * @param value the field value; may be null
+     * @return the text, or null for a null value; never a nid
+     */
+    String formatFieldValue(Object value) {
+        if (value == null) {
+            return null;
+        }
+        // Before the public id case: a vertex has a UUID of its own, so it is a public id, but
+        // it is not a component, and asking the store for its nid would assign it one.
+        if (value instanceof EntityVertex vertex) {
+            return DiTreeText.vertex(vertex, this::getDescriptionForNid);
+        }
+        if (value instanceof DiTreeEntity tree) {
+            return '\n' + DiTreeText.tree(tree, this::getDescriptionForNid);
+        }
+        if (value instanceof PublicId publicId) {
+            try {
+                long nid = EntityService.get().nidForPublicId(publicId);
+                return getDescriptionForNid(nid);
+            } catch (Exception e) {
+                // The component is not in this store. It is written by its UUIDs.
+                return uuidsOf(publicId);
+            }
+        }
+        if (value instanceof EntityFacade facade) {
+            return getDescriptionForNid(facade.nid());
+        }
+        if (value instanceof LongIdCollection idCollection) {
+            return formatIdCollection(idCollection);
+        }
+        return value.toString();
+    }
+
+    /**
+     * The UUIDs of a public id, joined by commas.
+     *
+     * @param publicId the public id
+     * @return its UUIDs, or {@link #UNIDENTIFIED} when it holds none
+     */
+    static String uuidsOf(PublicId publicId) {
+        UUID[] uuids = publicId.asUuidArray();
+        if (uuids.length == 0) {
+            return UNIDENTIFIED;
+        }
+        StringBuilder text = new StringBuilder();
+        for (int i = 0; i < uuids.length; i++) {
+            if (i > 0) {
+                text.append(", ");
+            }
+            text.append(uuids[i]);
+        }
+        return text.toString();
+    }
+
+    /**
+     * Renders an {@link LongIdCollection} field value as {@code name [SCTID x]} (or
+     * {@code [UUID x]}) per element.
+     *
+     * <p>Deliberately not {@code LongIdCollection.toString()}, which emits
+     * {@code Detected <134985573>} — a bare, unlabelled <strong>nid</strong>. A nid is a
+     * machine-local, ephemeral identifier, and an unlabelled number next to a clinical concept
+     * name reads like a terminology code: a consumer (including an LLM) will mistake it for an
+     * SCTID and publish it as one. Every identifier emitted here is explicitly typed.
+     *
+     * @param idCollection the field value
+     * @return the rendered collection, e.g. {@code "[Detected [SCTID 260373001], …]"}
+     */
+    private String formatIdCollection(LongIdCollection idCollection) {
+        StringBuilder sb = new StringBuilder("[");
+        long[] nids = idCollection.toArray();
+        for (int i = 0; i < nids.length; i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(getDescriptionForNid(nids[i]))
+                    .append(' ')
+                    .append(typedIdentifierFor(nids[i]));
+        }
+        return sb.append(']').toString();
+    }
+
+    /**
+     * An explicitly-typed identifier for a component: its SNOMED SCTID when it carries one,
+     * else its public UUID. Never a bare number, and never a nid: a component this store has
+     * no public id for is marked as unidentified.
+     *
+     * @param nid the component nid
+     * @return the bracketed identifier, e.g. {@code "[SCTID 260373001]"}
+     */
+    private String typedIdentifierFor(long nid) {
+        String sctid = sctidForNid(nid);
+        if (sctid != null) {
+            return "[SCTID " + sctid + "]";
+        }
+        return leastUuidFor(nid)
+                .map(uuid -> "[UUID " + uuid + "]")
+                .orElse("[" + UNIDENTIFIED + "]");
+    }
+
+    /**
+     * The SNOMED CT identifier of a component, read from its
+     * {@link KernelTerm#IDENTIFIER_PATTERN} semantic whose source is {@link KernelTerm#SCTID}.
+     *
+     * @param nid the component nid
+     * @return the SCTID, or {@code null} when the component carries none
+     */
+    private String sctidForNid(long nid) {
+        try {
+            List<SemanticEntity<SemanticEntityVersion>> identifierSemantics = EntityService.get()
+                    .semanticsForComponentOfPattern(nid, KernelTerm.IDENTIFIER_PATTERN.nid()).toList();
+            for (SemanticEntity<SemanticEntityVersion> semantic : identifierSemantics) {
+                if (semantic.versions().isEmpty()) {
+                    continue;
+                }
+                SemanticEntityVersion version = semantic.versions().get(semantic.versions().size() - 1);
+                String identifierValue = null;
+                long sourceNid = 0;
+                for (Object field : version.fieldValues()) {
+                    if (field instanceof String stringField) {
+                        identifierValue = stringField;
+                    } else if (field instanceof EntityFacade facade) {
+                        sourceNid = facade.nid();
+                    }
+                }
+                if (identifierValue != null && sourceNid == KernelTerm.SCTID.nid()) {
+                    return identifierValue;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Could not resolve SCTID for nid {}: {}", nid, e.getMessage());
+        }
+        return null;
+    }
+
+    private String formatFieldValue(Object value, ViewCalculatorWithCache calc) {
+        // Always use the default calculator for name resolution (same rationale as getDescriptionForNid)
+        return formatFieldValue(value);
+    }
+
+    private String determineChangeType(String priorValue, String currentValue) {
+        if (priorValue == null && currentValue != null) {
+            return "ADDED";
+        } else if (priorValue != null && currentValue == null) {
+            return "REMOVED";
+        } else {
+            return "MODIFIED";
+        }
+    }
+
+    @Override
+    public ConceptSemanticsResponse getConceptComments(String conceptId) {
+        return getConceptComments(conceptId, null);
+    }
+
+    @Override
+    public ConceptSemanticsResponse getConceptComments(String conceptId, ViewCalculatorWithCache viewCalculator) {
+        ViewCalculatorWithCache calc = resolveCalculator(viewCalculator);
+        try {
+            PublicId publicId = primitive.getPublicId(conceptId);
+            long conceptNid = EntityService.get().nidForPublicId(publicId);
+
+            // Get the concept description — use safe helper that handles restricted states
+            String conceptDescription = getDescriptionForNid(conceptNid, calc);
+
+            // Get all comment semantics for this concept using the Comment Pattern
+            List<SemanticEntity<SemanticEntityVersion>> commentSemantics = EntityService.get()
+                    .semanticsForComponentOfPattern(conceptNid, KernelTerm.COMMENT_PATTERN.nid()).toList();
+
+            List<SemanticInfo> semantics = new ArrayList<>();
+            for (SemanticEntity<SemanticEntityVersion> commentSemantic : commentSemantics) {
+                TinkarConceptSemanticInfo protoSemantic = buildSemanticInfoProto(commentSemantic.nid(), calc);
+                if (protoSemantic != null) {
+                    semantics.add(convertProtoSemanticToDto(protoSemantic));
+                }
+            }
+
+            return ConceptSemanticsResponse.success(conceptId, conceptDescription, semantics);
+        } catch (Exception e) {
+            log.error("Failed to get comments for concept {}: {}", conceptId, e.getMessage(), e);
+            return ConceptSemanticsResponse.error(conceptId, e.getMessage());
+        }
+    }
+
+    @Override
+    public ConceptSemanticsResponse inspectConcept(String conceptId) {
+        return inspectConcept(conceptId, null);
+    }
+
+    @Override
+    public ConceptSemanticsResponse inspectConcept(String conceptId, ViewCalculatorWithCache viewCalculator) {
+        // Delegate to proto implementation and convert to DTO
+        TinkarConceptSemanticsResponse protoResponse = inspectConceptProto(conceptId, viewCalculator);
+        ConceptSemanticsResponse response = convertProtoToDto(protoResponse);
+        if (!Boolean.TRUE.equals(response.success())) {
+            return response;
+        }
+        // Added here rather than in the proto path: the concept's own STAMP is what a detail
+        // header shows, and carrying it would mean changing ike_types.proto in tinkar-schema.
+        return ConceptSemanticsResponse.success(
+                response.conceptId(),
+                response.conceptDescription(),
+                response.semantics(),
+                conceptStampInfo(conceptId, viewCalculator));
+    }
+
+    private ConceptSemanticsResponse convertProtoToDto(TinkarConceptSemanticsResponse proto) {
+        if (!proto.getSuccess()) {
+            String conceptId = ProtoConversionUtils.leastUuid(proto.getConceptPublicId());
+            return ConceptSemanticsResponse.error(conceptId, proto.getErrorMessage());
+        }
+
+        String conceptId = ProtoConversionUtils.leastUuid(proto.getConceptPublicId());
+
+        List<SemanticInfo> semantics = new ArrayList<>();
+        for (TinkarConceptSemanticInfo protoSemantic : proto.getSemanticsList()) {
+            semantics.add(convertProtoSemanticToDto(protoSemantic));
+        }
+
+        return ConceptSemanticsResponse.success(conceptId, proto.getConceptDescription(), semantics);
+    }
+
+    private SemanticInfo convertProtoSemanticToDto(TinkarConceptSemanticInfo protoSemantic) {
+        String semanticId = ProtoConversionUtils.leastUuid(protoSemantic.getSemanticPublicId());
+
+        List<FieldValue> fields = new ArrayList<>();
+        for (int i = 0; i < protoSemantic.getFieldsCount(); i++) {
+            dev.ikm.tinkar.schema.Field field = protoSemantic.getFields(i);
+            fields.add(new FieldValue(i, field.getStringValue()));
+        }
+
+        TinkarStampInfo protoStamp = protoSemantic.getStamp();
+        ConceptSemanticsResponse.StampInfo stampInfo = new ConceptSemanticsResponse.StampInfo(
+                protoStamp.getStatus().isEmpty() ? null : protoStamp.getStatus(),
+                protoStamp.getAuthor().isEmpty() ? null : protoStamp.getAuthor(),
+                protoStamp.getModule().isEmpty() ? null : protoStamp.getModule(),
+                protoStamp.getPath().isEmpty() ? null : protoStamp.getPath(),
+                protoStamp.getTime(),
+                protoStamp.getFormattedTime().isEmpty() ? null : protoStamp.getFormattedTime()
+        );
+
+        return new SemanticInfo(semanticId, protoSemantic.getPatternName(), fields, stampInfo);
+    }
+
+    @Override
+    public TinkarConceptSemanticsResponse inspectConceptProto(String conceptId) {
+        return inspectConceptProto(conceptId, null);
+    }
+
+    @Override
+    public TinkarConceptSemanticsResponse inspectConceptProto(String conceptId, ViewCalculatorWithCache viewCalculator) {
+        ViewCalculatorWithCache calc = resolveCalculator(viewCalculator);
+        try {
+            PublicId publicId = primitive.getPublicId(conceptId);
+            long conceptNid = EntityService.get().nidForPublicId(publicId);
+
+            // Get the concept description — use safe helper that handles restricted states
+            String conceptDescription = getDescriptionForNid(conceptNid, calc);
+
+            // Get all semantics for this concept (any pattern)
+            List<SemanticEntity<SemanticEntityVersion>> semantics =
+                    EntityService.get().semanticsForComponent(conceptNid).toList();
+
+            TinkarConceptSemanticsResponse.Builder responseBuilder = TinkarConceptSemanticsResponse.newBuilder()
+                    .setConceptPublicId(protoPublicId(publicId))
+                    .setConceptDescription(conceptDescription)
+                    .setSuccess(true);
+
+            int count = 0;
+            for (SemanticEntity<SemanticEntityVersion> semantic : semantics) {
+                TinkarConceptSemanticInfo semanticInfo = buildSemanticInfoProto(semantic.nid(), calc);
+                if (semanticInfo != null) {
+                    responseBuilder.addSemantics(semanticInfo);
+                    count++;
+                }
+            }
+            responseBuilder.setTotalCount(count);
+            responseBuilder.setCreatedAt(System.currentTimeMillis());
+
+            return responseBuilder.build();
+        } catch (Exception e) {
+            log.error("Failed to get semantics proto for concept {}: {}", conceptId, e.getMessage(), e);
+            return TinkarConceptSemanticsResponse.newBuilder()
+                    .setConceptPublicId(protoPublicIdOrEmpty(conceptId))
+                    .setSuccess(false)
+                    .setErrorMessage(e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName())
+                    .setTotalCount(0)
+                    .setCreatedAt(System.currentTimeMillis())
+                    .build();
+        }
+    }
+
+    @Override
+    public TinkarSemanticInfoResponse getSemanticInfo(String semanticId) {
+        return getSemanticInfo(semanticId, null);
+    }
+
+    @Override
+    public TinkarSemanticInfoResponse getSemanticInfo(String semanticId, ViewCalculatorWithCache viewCalculator) {
+        ViewCalculatorWithCache calc = resolveCalculator(viewCalculator);
+        try {
+            PublicId publicId = primitive.getPublicId(semanticId);
+            long semanticNid = EntityService.get().nidForPublicId(publicId);
+
+            TinkarConceptSemanticInfo semanticInfo = buildSemanticInfoProto(semanticNid, calc);
+            if (semanticInfo == null) {
+                return TinkarSemanticInfoResponse.newBuilder()
+                        .setSuccess(false)
+                        .setErrorMessage("No semantic found (or no version visible under the current "
+                                + "coordinates) for: " + semanticId)
+                        .setCreatedAt(System.currentTimeMillis())
+                        .build();
+            }
+            return TinkarSemanticInfoResponse.newBuilder()
+                    .setSuccess(true)
+                    .setSemantic(semanticInfo)
+                    .setCreatedAt(System.currentTimeMillis())
+                    .build();
+        } catch (Exception e) {
+            log.error("Failed to get semantic info for {}: {}", semanticId, e.getMessage(), e);
+            return TinkarSemanticInfoResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorMessage(e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName())
+                    .setCreatedAt(System.currentTimeMillis())
+                    .build();
+        }
+    }
+
+    @Override
+    public TinkarConceptEntityResponse loadConceptEntityGraph(String conceptId) {
+        try {
+            EntityToTinkarSchemaTransformer transformer = EntityToTinkarSchemaTransformer.getInstance();
+            TinkarConceptEntityResponse.Builder builder = TinkarConceptEntityResponse.newBuilder();
+            Set<Long> includedNids = new HashSet<>();
+            Set<Long> stampNids = new HashSet<>();
+            // NIDs of entities referenced by field values / stamps — must be loaded so
+            // the client can resolve EntityProxy.publicId() without hitting null.
+            Set<Long> referencedNids = new HashSet<>();
+
+            // 1. Fetch the concept entity
+            PublicId publicId = primitive.getPublicId(conceptId);
+            long conceptNid = EntityService.get().nidForPublicId(publicId);
+            Entity<?> conceptEntity = EntityHandle.get(conceptNid).orNull();
+            if (conceptEntity == null) {
+                return TinkarConceptEntityResponse.newBuilder()
+                        .setSuccess(false)
+                        .setErrorMessage("Concept not found: " + conceptId)
+                        .setCreatedAt(System.currentTimeMillis())
+                        .build();
+            }
+            addToResponse(builder, transformer, includedNids, conceptEntity);
+            conceptEntity.versions().forEach(v -> stampNids.add(v.stampNid()));
+
+            // 2. Fetch all semantics attached to the concept
+            List<SemanticEntity<SemanticEntityVersion>> conceptSemantics =
+                    EntityService.get().semanticsForComponent(conceptNid).toList();
+            Set<Long> patternNids = new HashSet<>();
+            for (SemanticEntity<SemanticEntityVersion> semantic : conceptSemantics) {
+                if (includedNids.contains(semantic.nid())) continue;
+                addToResponse(builder, transformer, includedNids, semantic);
+                patternNids.add(semantic.patternNid());
+                semantic.versions().forEach(v -> {
+                    stampNids.add(v.stampNid());
+                    // Collect entity refs from field values so the client can resolve publicId()
+                    collectPublicIdRefs(v.fieldValues(), referencedNids);
+                });
+            }
+
+            // 3. Fetch pattern entities referenced by the semantics.
+            //    Also collect field-definition dataType/purpose/meaning concept NIDs so the
+            //    client can resolve FieldDefinitionForEntity.dataType(), .purpose(), .meaning()
+            //    without hitting getConceptOrThrow on absent entities.
+            //    Always include the stamp version pattern — required by
+            //    StampCalculator.changeChronology() to determine what fields stamps contain.
+            //    Without it, latest(stamp version pattern) returns empty and the History tab
+            //    shows nothing in gRPC mode.
+            patternNids.add(EntityBinding.Stamp.Version.pattern().nid());
+            for (long patternNid : patternNids) {
+                if (includedNids.contains(patternNid)) continue;
+                Entity<?> patternEntity = EntityHandle.get(patternNid).orNull();
+                if (patternEntity != null) {
+                    addToResponse(builder, transformer, includedNids, patternEntity);
+                    patternEntity.versions().forEach(v -> {
+                        stampNids.add(v.stampNid());
+                        if (v instanceof PatternEntityVersion pev) {
+                            pev.fieldDefinitions().forEach(fd -> {
+                                referencedNids.add(fd.dataTypeNid());
+                                referencedNids.add(fd.purposeNid());
+                                referencedNids.add(fd.meaningNid());
+                            });
+                        }
+                    });
+                    // Include DESCRIPTION_PATTERN semantics so the client can resolve the
+                    // pattern's preferred name and FQN without a separate round-trip.
+                    List<SemanticEntity<SemanticEntityVersion>> patDescSemantics = EntityService.get()
+                            .semanticsForComponentOfPattern(patternNid, KernelTerm.DESCRIPTION_PATTERN.nid()).toList();
+                    for (SemanticEntity<SemanticEntityVersion> descSem : patDescSemantics) {
+                        if (includedNids.contains(descSem.nid())) continue;
+                        addToResponse(builder, transformer, includedNids, descSem);
+                        descSem.versions().forEach(v -> stampNids.add(v.stampNid()));
+                    }
+                }
+            }
+
+            // 4. Fetch stamp entities; collect status/author/module/path concept refs
+            for (long stampNid : stampNids) {
+                if (includedNids.contains(stampNid)) continue;
+                StampEntity<?> stampEntity = EntityService.get().getStampFast(stampNid);
+                if (stampEntity != null) {
+                    addToResponse(builder, transformer, includedNids, stampEntity);
+                    // These are concept NIDs the client needs to resolve for display
+                    referencedNids.add(stampEntity.stateNid());
+                    referencedNids.add(stampEntity.authorNid());
+                    referencedNids.add(stampEntity.moduleNid());
+                    referencedNids.add(stampEntity.pathNid());
+                }
+            }
+
+            // 5. Load all referenced concept entities + their description semantics + stamps.
+            //    This lets the client resolve EntityProxy.publicId() and PrimitiveData.text()
+            //    for status, author, module, path, language, description-type, etc.
+            Set<Long> descStampNids = new HashSet<>();
+            for (long refNid : referencedNids) {
+                if (includedNids.contains(refNid)) continue;
+                Entity<?> refEntity = EntityHandle.get(refNid).orNull();
+                if (refEntity == null) continue;
+                addToResponse(builder, transformer, includedNids, refEntity);
+                // Include description semantics so text() lookups work on the client
+                List<SemanticEntity<SemanticEntityVersion>> descSemantics =
+                        EntityService.get().semanticsForComponent(refNid).toList();
+                for (SemanticEntity<SemanticEntityVersion> descSem : descSemantics) {
+                    if (includedNids.contains(descSem.nid())) continue;
+                    addToResponse(builder, transformer, includedNids, descSem);
+                    descSem.versions().forEach(v -> descStampNids.add(v.stampNid()));
+                }
+            }
+
+            // 6. Stamps for the referenced-entity description semantics
+            for (long descStampNid : descStampNids) {
+                if (includedNids.contains(descStampNid)) continue;
+                Entity<?> stampEntity = EntityHandle.get(descStampNid).orNull();
+                if (stampEntity != null) {
+                    addToResponse(builder, transformer, includedNids, stampEntity);
+                }
+            }
+
+            // 7. Load concept entities for navigation semantic neighbors (parents + children).
+            //    NavigationCalculatorWithCache.intIdListForMeaningFromPattern() filters neighbors
+            //    via vertexStampCalculator.latest(neighborNid). In gRPC/ephemeral-store mode the
+            //    neighbor concept entities are absent, so latest() returns empty and all children
+            //    (and any parents not already loaded via axiom refs) are silently dropped.
+            //    Load only the concept entity + DESCRIPTION_PATTERN semantics per neighbor —
+            //    enough for state-filtering and preferred-description-text lookups in the UI.
+            Set<Long> navNeighborNids = new HashSet<>();
+            for (SemanticEntity<SemanticEntityVersion> semantic : conceptSemantics) {
+                long patNid = semantic.patternNid();
+                if (patNid != KernelTerm.INFERRED_NAVIGATION_PATTERN.nid() &&
+                        patNid != KernelTerm.STATED_NAVIGATION_PATTERN.nid()) continue;
+                semantic.versions().forEach(v -> v.fieldValues().forEach(fv -> {
+                    if (fv instanceof LongIdCollection intIds) {
+                        intIds.forEach(nid -> navNeighborNids.add(nid));
+                    }
+                }));
+            }
+            Set<Long> navStampNids = new HashSet<>();
+            for (long neighborNid : navNeighborNids) {
+                if (includedNids.contains(neighborNid)) continue;
+                Entity<?> neighborEntity = EntityHandle.get(neighborNid).orNull();
+                if (neighborEntity == null) continue;
+                addToResponse(builder, transformer, includedNids, neighborEntity);
+                neighborEntity.versions().forEach(v -> navStampNids.add(v.stampNid()));
+                // Load description semantics for preferred-description-text lookups in hierarchy view
+                List<SemanticEntity<SemanticEntityVersion>> neighborDescSemantics = EntityService.get()
+                        .semanticsForComponentOfPattern(neighborNid, KernelTerm.DESCRIPTION_PATTERN.nid()).toList();
+                for (SemanticEntity<SemanticEntityVersion> descSem : neighborDescSemantics) {
+                    if (includedNids.contains(descSem.nid())) continue;
+                    addToResponse(builder, transformer, includedNids, descSem);
+                    descSem.versions().forEach(v -> navStampNids.add(v.stampNid()));
+                }
+            }
+            for (long navStampNid : navStampNids) {
+                if (includedNids.contains(navStampNid)) continue;
+                Entity<?> stampEntity = EntityHandle.get(navStampNid).orNull();
+                if (stampEntity != null) {
+                    addToResponse(builder, transformer, includedNids, stampEntity);
+                }
+            }
+
+            return builder.setSuccess(true).setCreatedAt(System.currentTimeMillis()).build();
+        } catch (Exception e) {
+            log.error("Failed to get concept with semantics for {}: {}", conceptId, e.getMessage(), e);
+            return TinkarConceptEntityResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorMessage(e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName())
+                    .setCreatedAt(System.currentTimeMillis())
+                    .build();
+        }
+    }
+
+    @Override
+    public TinkarConceptEntityResponse getEntityByPublicId(String entityId) {
+        try {
+            EntityToTinkarSchemaTransformer transformer = EntityToTinkarSchemaTransformer.getInstance();
+            TinkarConceptEntityResponse.Builder builder = TinkarConceptEntityResponse.newBuilder();
+            Set<Long> includedNids = new HashSet<>();
+
+            PublicId publicId = primitive.getPublicId(entityId);
+            long nid = EntityService.get().nidForPublicId(publicId);
+            Entity<?> entity = EntityHandle.get(nid).orNull();
+            if (entity == null) {
+                return TinkarConceptEntityResponse.newBuilder()
+                        .setSuccess(false)
+                        .setErrorMessage("Entity not found: " + entityId)
+                        .setCreatedAt(System.currentTimeMillis())
+                        .build();
+            }
+            addToResponse(builder, transformer, includedNids, entity);
+
+            // Include version stamps so the client can render status/author/module/path
+            Set<Long> stampNids = new HashSet<>();
+            entity.versions().forEach(v -> stampNids.add(v.stampNid()));
+
+            // Include the entity's DESCRIPTION_PATTERN semantics so the client can resolve a
+            // display NAME for it. Without them the client gets the entity but
+            // getFullyQualifiedNameText() stays empty, so any UI that renders a name falls back
+            // to the raw nid — a machine-local integer shown where a concept name belongs.
+            // This is the on-demand counterpart to loadConceptEntityGraph, which already ships
+            // descriptions; callers of this cheaper single-entity path need a name just as much.
+            // The navigation semantics come too: they hold the entity's parents and children, so a
+            // client navigator can place it in the tree and expand it one level at a time.
+            List<SemanticEntity<SemanticEntityVersion>> descriptions = Stream.of(
+                            KernelTerm.DESCRIPTION_PATTERN,
+                            KernelTerm.INFERRED_NAVIGATION_PATTERN,
+                            KernelTerm.STATED_NAVIGATION_PATTERN)
+                    .flatMap(pattern -> EntityService.get().semanticsForComponentOfPattern(nid, pattern.nid()))
+                    .toList();
+            for (SemanticEntity<SemanticEntityVersion> descriptionEntity : descriptions) {
+                if (includedNids.contains(descriptionEntity.nid())) {
+                    continue;
+                }
+                addToResponse(builder, transformer, includedNids, descriptionEntity);
+                descriptionEntity.versions().forEach(v -> stampNids.add(v.stampNid()));
+            }
+
+            for (long stampNid : stampNids) {
+                StampEntity<?> stampEntity = EntityService.get().getStampFast(stampNid);
+                if (stampEntity != null) {
+                    addToResponse(builder, transformer, includedNids, stampEntity);
+                }
+            }
+
+            return builder.setSuccess(true).setCreatedAt(System.currentTimeMillis()).build();
+        } catch (Exception e) {
+            log.error("Failed to get entity by public ID {}: {}", entityId, e.getMessage(), e);
+            return TinkarConceptEntityResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorMessage(e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName())
+                    .setCreatedAt(System.currentTimeMillis())
+                    .build();
+        }
+    }
+
+    /** Adds an entity to the proto response if not already included. */
+    private void addToResponse(TinkarConceptEntityResponse.Builder builder,
+                               EntityToTinkarSchemaTransformer transformer,
+                               Set<Long> includedNids,
+                               Entity<?> entity) {
+        if (entity != null && includedNids.add(entity.nid())) {
+            try {
+                builder.addEntities(transformer.transform(entity));
+            } catch (IllegalStateException | UnsupportedOperationException e) {
+                // The entity refers to a component whose identity this store has lost — a nid
+                // with no entity and no recorded UUID. A semantic is sent without the lost ids, so
+                // a navigation semantic still carries the parents and children that do resolve;
+                // anything else is left out rather than failing the whole concept.
+                if (entity instanceof SemanticRecord semantic) {
+                    try {
+                        builder.addEntities(transformer.transform(withoutLostIds(semantic)));
+                        log.warn("Sent {} without the ids whose identity this store has lost: {}",
+                                entity.publicId().idString(), e.getMessage());
+                        return;
+                    } catch (IllegalStateException | UnsupportedOperationException stillFailing) {
+                        // Fall through and leave it out.
+                    }
+                }
+                log.warn("Left {} out of the concept response: {}", entity.publicId().idString(), e.getMessage());
+            }
+        }
+    }
+
+    /** A copy of {@code semantic} whose id-set and id-list fields keep only ids that resolve to a UUID. */
+    private static SemanticRecord withoutLostIds(SemanticRecord semantic) {
+        RecordListBuilder<SemanticVersionRecord> versions = RecordListBuilder.make();
+        SemanticRecord copy = new SemanticRecord(semantic.mostSignificantBits(), semantic.leastSignificantBits(),
+                semantic.additionalUuidLongs(), semantic.nid(), semantic.patternNid(),
+                semantic.referencedComponentNid(), versions);
+        for (SemanticVersionRecord version : semantic.versions()) {
+            versions.add(new SemanticVersionRecord(copy, version.stampNid(),
+                    version.fieldValues().collect(TinkarServiceImpl::withoutLostIds)));
+        }
+        versions.build();
+        return copy;
+    }
+
+    private static Object withoutLostIds(Object fieldValue) {
+        return switch (fieldValue) {
+            case LongIdSet set -> LongIds.set.of(set.longStream().filter(TinkarServiceImpl::hasIdentity).toArray());
+            case LongIdList list -> LongIds.list.of(list.longStream().filter(TinkarServiceImpl::hasIdentity).toArray());
+            default -> fieldValue;
+        };
+    }
+
+    private static boolean hasIdentity(long nid) {
+        try {
+            PrimitiveData.publicId(nid);
+            return true;
+        } catch (IllegalStateException | UnsupportedOperationException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Collects NIDs of entities referenced by semantic field values.  Handles:
+     * <ul>
+     *   <li>{@link PublicId} / {@link EntityProxy} – concept/pattern/semantic references so the
+     *       client can resolve {@code EntityProxy.publicId()} without NPE.</li>
+     *   <li>{@link DiTreeEntity} – EL++ axiom trees.  Every vertex in the tree references concept
+     *       NIDs (meaning, property keys, concept-valued properties).  These must all be present in
+     *       the client's ephemeral store so the axiom renderer can show concept names instead of raw
+     *       NID numbers.</li>
+     * </ul>
+     */
+    private void collectPublicIdRefs(Iterable<?> fieldValues, Set<Long> refs) {
+        for (Object value : fieldValues) {
+            if (value instanceof PublicId pid) {
+                try {
+                    refs.add(EntityService.get().nidForPublicId(pid));
+                } catch (Exception ignored) {
+                    // PublicId not registered in this store — skip
+                }
+            } else if (value instanceof EntityProxy proxy) {
+                refs.add(proxy.nid());
+            } else if (value instanceof DiTreeEntity diTree) {
+                // Axiom tree: collect every concept NID referenced by every vertex so the
+                // client can render concept names (role types, role values, etc.)
+                MutableLongSet vertexConceptNids = LongSets.mutable.empty();
+                diTree.vertexMap().forEach(vertex -> {
+                    if (vertex != null) {
+                        vertex.addConceptsReferencedByVertex(vertexConceptNids);
+                    }
+                });
+                vertexConceptNids.forEach(refs::add);
+            }
+        }
+    }
+
+    /**
+     * The field names of a pattern, in field-definition order — each the description of the
+     * field definition's <em>meaning</em> concept (e.g. "Limit of detection"). Returns an empty
+     * list when the pattern has no version visible under the current coordinates, so callers
+     * fall back to positional naming rather than failing.
+     */
+    private List<String> fieldNamesForPattern(long patternNid, ViewCalculatorWithCache calc) {
+        try {
+            Latest<PatternEntityVersion> latestPattern = calc.stampCalculator().latest(patternNid);
+            if (!latestPattern.isPresent()) {
+                return List.of();
+            }
+            List<String> names = new ArrayList<>();
+            latestPattern.get().fieldDefinitions()
+                    .forEach(fd -> names.add(getDescriptionForNid(fd.meaningNid(), calc)));
+            return names;
+        } catch (Exception e) {
+            log.debug("Could not resolve field names for pattern {}: {}", patternNid, e.getMessage());
+            return List.of();
+        }
+    }
+
+    private TinkarConceptSemanticInfo buildSemanticInfoProto(long semanticNid, ViewCalculatorWithCache calc) {
+        try {
+            Entity<?> entity = EntityHandle.get(semanticNid).orNull();
+            if (!(entity instanceof SemanticEntity<?> semanticEntity)) {
+                return null;
+            }
+
+            // Use the stamp calculator to get the latest version that matches the stamp coordinates
+            // (respects allowedStates, positionTime, path, modules filters)
+            Latest<SemanticEntityVersion> latestResult = calc.stampCalculator().latest(semanticNid);
+            if (!latestResult.isPresent()) {
+                return null; // No version visible under the current coordinates
+            }
+            SemanticEntityVersion latestVersion = latestResult.get();
+
+            // Get the pattern name
+            String patternName = getDescriptionForNid(semanticEntity.patternNid(), calc);
+
+            TinkarConceptSemanticInfo.Builder semanticBuilder = TinkarConceptSemanticInfo.newBuilder()
+                    .setSemanticPublicId(protoPublicId(semanticEntity.publicId()))
+                    .setPatternName(patternName);
+
+            // Build field values
+            Object[] fieldValues = latestVersion.fieldValues().toArray();
+            for (Object fieldValue : fieldValues) {
+                String value = formatFieldValue(fieldValue, calc);
+                if (value != null) {
+                    semanticBuilder.addFields(
+                            dev.ikm.tinkar.schema.Field.newBuilder()
+                                    .setStringValue(value)
+                                    .build());
+                }
+            }
+
+            // Build named field values. Indexed (not filtered like `fields` above) so each value
+            // stays aligned with the pattern's field definition that names it.
+            List<String> fieldNames = fieldNamesForPattern(semanticEntity.patternNid(), calc);
+            for (int i = 0; i < fieldValues.length; i++) {
+                String value = formatFieldValue(fieldValues[i], calc);
+                String name = i < fieldNames.size() ? fieldNames.get(i) : "field " + i;
+                semanticBuilder.addNamedFields(
+                        TinkarSemanticField.newBuilder()
+                                .setName(name)
+                                .setValue(value == null ? "" : value)
+                                .build());
+            }
+
+            // Build stamp info
+            semanticBuilder.setStamp(buildStampInfoProto(latestVersion.stampNid(), calc));
+
+            return semanticBuilder.build();
+        } catch (Exception e) {
+            log.warn("Failed to build semantic info proto for nid {}: {}", semanticNid, e.getMessage());
+            return null;
+        }
+    }
+
+    private TinkarStampInfo buildStampInfoProto(long stampNid, ViewCalculatorWithCache calc) {
+        TinkarStampInfo.Builder stampBuilder = TinkarStampInfo.newBuilder();
+        try {
+            StampEntity<?> stampEntity = EntityService.get().getStampFast(stampNid);
+            if (stampEntity == null) {
+                return stampBuilder.build();
+            }
+
+            // Stamp component NIDs (status/author/module/path) are fixed system concepts
+            // that don't have dialect-specific descriptions — use the default calculator.
+            String status = getDescriptionForNid(stampEntity.stateNid());
+            String author = getDescriptionForNid(stampEntity.authorNid());
+            String module = getDescriptionForNid(stampEntity.moduleNid());
+            String path = getDescriptionForNid(stampEntity.pathNid());
+            long time = stampEntity.time();
+            String formattedTime = formatTimestamp(time);
+
+            if (status != null) stampBuilder.setStatus(status);
+            if (author != null) stampBuilder.setAuthor(author);
+            if (module != null) stampBuilder.setModule(module);
+            if (path != null) stampBuilder.setPath(path);
+            stampBuilder.setTime(time);
+            if (formattedTime != null) stampBuilder.setFormattedTime(formattedTime);
+
+            return stampBuilder.build();
+        } catch (Exception e) {
+            log.warn("Failed to build STAMP info proto for stampNid {}: {}", stampNid, e.getMessage());
+            return stampBuilder.build();
+        }
+    }
+
+    @Override
+    public ConceptChangeHistoryResponse getConceptChangeHistory(String conceptId) {
+        return getConceptChangeHistory(conceptId, null);
+    }
+
+    @Override
+    public ConceptChangeHistoryResponse getConceptChangeHistory(String conceptId, ViewCalculatorWithCache viewCalculator) {
+        ViewCalculatorWithCache calc = resolveCalculator(viewCalculator);
+        try {
+            PublicId publicId = primitive.getPublicId(conceptId);
+            long conceptNid = EntityService.get().nidForPublicId(publicId);
+
+            // Get the concept description — use safe helper that handles restricted states
+            String conceptDescription = getDescriptionForNid(conceptNid, calc);
+
+            // Get change chronology for the concept itself
+            ChangeChronology conceptChronology = calc.stampCalculator()
+                    .changeChronology(conceptNid);
+            List<ConceptChangeHistoryResponse.VersionChange> conceptChanges =
+                    convertToConceptVersionChanges(conceptChronology, calc);
+
+            // Get all semantics attached to this concept and their change histories
+            List<SemanticEntity<SemanticEntityVersion>> semantics =
+                    EntityService.get().semanticsForComponent(conceptNid).toList();
+            List<ConceptChangeHistoryResponse.SemanticChangeHistory> semanticChanges = new ArrayList<>();
+
+            for (SemanticEntity<SemanticEntityVersion> semantic : semantics) {
+                ConceptChangeHistoryResponse.SemanticChangeHistory semanticHistory =
+                        buildSemanticChangeHistory(semantic.nid(), calc);
+                if (semanticHistory != null) {
+                    semanticChanges.add(semanticHistory);
+                }
+            }
+
+            return ConceptChangeHistoryResponse.success(conceptId, conceptDescription, conceptChanges, semanticChanges);
+        } catch (Exception e) {
+            log.error("Failed to get concept change history for {}: {}", conceptId, e.getMessage(), e);
+            return ConceptChangeHistoryResponse.error(conceptId, e.getMessage());
+        }
+    }
+
+    private List<ConceptChangeHistoryResponse.VersionChange> convertToConceptVersionChanges(
+            ChangeChronology changeChronology, ViewCalculatorWithCache calc) {
+        List<ConceptChangeHistoryResponse.VersionChange> versionChanges = new ArrayList<>();
+
+        for (VersionChangeRecord versionChange : changeChronology.changeRecords()) {
+            ConceptChangeHistoryResponse.StampInfo stampInfo = buildConceptStampInfo(versionChange.stampNid(), calc);
+            List<ConceptChangeHistoryResponse.FieldChange> fieldChanges = convertToConceptFieldChanges(versionChange.changes(), calc);
+            versionChanges.add(new ConceptChangeHistoryResponse.VersionChange(stampInfo, fieldChanges));
+        }
+
+        return versionChanges;
+    }
+
+    private ConceptChangeHistoryResponse.StampInfo buildConceptStampInfo(long stampNid, ViewCalculatorWithCache calc) {
+        try {
+            StampEntity<?> stampEntity = EntityService.get().getStampFast(stampNid);
+            if (stampEntity == null) {
+                return new ConceptChangeHistoryResponse.StampInfo(null, null, null, null, null, null);
+            }
+
+            String status = getDescriptionForNid(stampEntity.stateNid());
+            String author = getDescriptionForNid(stampEntity.authorNid());
+            String module = getDescriptionForNid(stampEntity.moduleNid());
+            String path = getDescriptionForNid(stampEntity.pathNid());
+            long time = stampEntity.time();
+            String formattedTime = formatTimestamp(time);
+
+            return new ConceptChangeHistoryResponse.StampInfo(status, author, module, path, time, formattedTime);
+        } catch (Exception e) {
+            log.warn("Failed to build STAMP info for stampNid {}: {}", stampNid, e.getMessage());
+            return new ConceptChangeHistoryResponse.StampInfo(null, null, null, null, null, null);
+        }
+    }
+
+    private List<ConceptChangeHistoryResponse.FieldChange> convertToConceptFieldChanges(
+            Iterable<FieldChangeRecord> fieldChangeRecords, ViewCalculatorWithCache calc) {
+        List<ConceptChangeHistoryResponse.FieldChange> fieldChanges = new ArrayList<>();
+
+        for (FieldChangeRecord fieldChange : fieldChangeRecords) {
+            String fieldName = determineFieldName(fieldChange, calc);
+            Integer fieldIndex = null;
+            if (fieldChange.currentValue() != null) {
+                fieldIndex = fieldChange.currentValue().indexInPattern();
+            } else if (fieldChange.priorValue() != null) {
+                fieldIndex = fieldChange.priorValue().indexInPattern();
+            }
+
+            String priorValue = fieldChange.priorValue() != null
+                    ? formatFieldValue(fieldChange.priorValue().value(), calc)
+                    : null;
+            String currentValue = fieldChange.currentValue() != null
+                    ? formatFieldValue(fieldChange.currentValue().value(), calc)
+                    : null;
+
+            String changeType = determineChangeType(priorValue, currentValue);
+
+            fieldChanges.add(new ConceptChangeHistoryResponse.FieldChange(
+                    fieldName, fieldIndex, priorValue, currentValue, changeType));
+        }
+
+        return fieldChanges;
+    }
+
+    private ConceptChangeHistoryResponse.SemanticChangeHistory buildSemanticChangeHistory(
+            long semanticNid, ViewCalculatorWithCache calc) {
+        try {
+            Entity<?> entity = EntityHandle.get(semanticNid).orNull();
+            if (!(entity instanceof SemanticEntity<?> semanticEntity)) {
+                return null;
+            }
+
+            // The semantic's identifier in response text
+            String semanticId = identifierFor(semanticNid);
+
+            // Get the pattern name
+            String patternName = getDescriptionForNid(semanticEntity.patternNid(), calc);
+
+            // Get a summary of the semantic content (first field value if available)
+            String summary = getSemanticSummary(semanticEntity, calc);
+
+            // Get change chronology for this semantic
+            ChangeChronology semanticChronology = calc.stampCalculator()
+                    .changeChronology(semanticNid);
+            List<ConceptChangeHistoryResponse.VersionChange> versionChanges =
+                    convertToConceptVersionChanges(semanticChronology, calc);
+
+            return new ConceptChangeHistoryResponse.SemanticChangeHistory(
+                    semanticId, patternName, summary, versionChanges);
+        } catch (Exception e) {
+            log.warn("Failed to build semantic change history for nid {}: {}", semanticNid, e.getMessage());
+            return null;
+        }
+    }
+
+    private String getSemanticSummary(SemanticEntity<?> semanticEntity, ViewCalculatorWithCache calc) {
+        try {
+            if (semanticEntity.versions().isEmpty()) {
+                return null;
+            }
+            SemanticEntityVersion latestVersion = semanticEntity.versions().get(
+                    semanticEntity.versions().size() - 1);
+
+            if (latestVersion.fieldValues().isEmpty()) {
+                return null;
+            }
+
+            // Get the first field value as summary
+            Object firstField = latestVersion.fieldValues().get(0);
+            String summary = formatFieldValue(firstField, calc);
+
+            // Truncate if too long
+            if (summary != null && summary.length() > 100) {
+                summary = summary.substring(0, 97) + "...";
+            }
+
+            return summary;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    @Override
+    public String saveChanges() {
+        log.info("Saving pending changes to persistent storage...");
+        try {
+            saveDataStore();
+            log.info("Changes saved successfully to persistent storage");
+            return "Changes saved successfully to persistent storage. Changes will now survive server restarts.";
+        } catch (Exception e) {
+            log.error("Failed to save changes: {}", e.getMessage(), e);
+            return "Failed to save changes: " + e.getMessage();
+        }
+    }
+
+    @Override
+    public String discardChanges() {
+        log.info("Discarding pending changes...");
+        try {
+            // To discard changes, we need to reload the data from disk
+            // This is a more complex operation that may require restarting the data provider
+            // For now, we'll just note that changes will be lost on restart
+            log.warn("Discard changes requested. Pending changes will be lost when the server restarts.");
+            return "Pending changes have been marked for discard. " +
+                   "Restart the server to reload data from the last saved state. " +
+                   "Note: Any changes made since the last save will be lost.";
+        } catch (Exception e) {
+            log.error("Failed to discard changes: {}", e.getMessage(), e);
+            return "Failed to discard changes: " + e.getMessage();
+        }
+    }
+
+    @Override
+    public DescendantOperationResponse addDescendant(String parentConceptId, String descendantConceptId) {
+        try {
+            PublicId parentPublicId = primitive.getPublicId(parentConceptId);
+            PublicId descendantPublicId = primitive.getPublicId(descendantConceptId);
+
+            long parentNid = EntityService.get().nidForPublicId(parentPublicId);
+            long descendantNid = EntityService.get().nidForPublicId(descendantPublicId);
+
+            // Get description for the descendant
+            String descendantDescription = Calculators.View.Default()
+                    .languageCalculator()
+                    .getRegularDescriptionText(descendantNid)
+                    .orElse("Unknown concept");
+
+            // Create a new semantic using STATED_NAVIGATION_PATTERN
+            // Field 0: Component ID Set for relationship destinations (parents)
+            // Field 1: Component ID Set for relationship origins (this would be for reverse lookup)
+            UUID semanticUuid = UUID.randomUUID();
+            long currentTime = System.currentTimeMillis();
+
+            Transaction transaction = Transaction.make("Add descendant " + descendantDescription + " to parent");
+
+            try {
+                StampEntity<?> stamp = transaction.getStamp(
+                        dev.ikm.tinkar.terms.State.ACTIVE,
+                        currentTime,
+                        KernelTerm.USER.nid(),
+                        KernelTerm.SOLOR_OVERLAY_MODULE.nid(),
+                        KernelTerm.DEVELOPMENT_PATH.nid()
+                );
+
+                // Build the semantic record with STATED_NAVIGATION_PATTERN
+                // The descendant concept references the parent as its destination (IS-A relationship)
+                LongIdSet destinationSet = LongIds.set.of(parentNid);
+                LongIdSet originSet = LongIds.set.empty();
+
+                SemanticRecord semanticRecord = SemanticRecord.build(
+                        semanticUuid,
+                        KernelTerm.STATED_NAVIGATION_PATTERN.nid(),
+                        descendantNid,  // The semantic is attached to the descendant concept
+                        stamp.versions().get(0),
+                        Lists.immutable.of(destinationSet, originSet)
+                );
+
+                EntityService.get().putEntity(semanticRecord);
+                transaction.addComponent(semanticRecord);
+                transaction.commit();
+
+                log.info("Created navigation semantic {} making {} a descendant of {}",
+                        semanticUuid, descendantConceptId, parentConceptId);
+
+                return DescendantOperationResponse.success(
+                        parentConceptId,
+                        descendantConceptId,
+                        descendantDescription,
+                        "CREATED"
+                );
+
+            } catch (Exception e) {
+                // The commit is inside the try, so this can run after it; a committed
+                // transaction is not canceled (IKE-Network/ike-issues#1243).
+                if (transaction.isOpen()) {
+                    transaction.cancel();
+                }
+                throw e;
+            }
+
+        } catch (Exception e) {
+            log.error("Failed to add descendant {} to parent {}: {}",
+                    descendantConceptId, parentConceptId, e.getMessage(), e);
+            return DescendantOperationResponse.error(parentConceptId, descendantConceptId, e.getMessage());
+        }
+    }
+
+    @Override
+    public DescendantOperationResponse createAndAddDescendant(String parentConceptId, String conceptName) {
+        try {
+            PublicId parentPublicId = primitive.getPublicId(parentConceptId);
+            long parentNid = EntityService.get().nidForPublicId(parentPublicId);
+
+            // Create a new concept with a new UUID
+            UUID newConceptUuid = UUID.randomUUID();
+            PublicId newConceptPublicId = PublicIds.of(newConceptUuid);
+            long currentTime = System.currentTimeMillis();
+
+            Transaction transaction = Transaction.make("Create new concept: " + conceptName);
+
+            try {
+                // Create STAMP for the new concept
+                StampEntity<?> stamp = transaction.getStamp(
+                        dev.ikm.tinkar.terms.State.ACTIVE,
+                        currentTime,
+                        KernelTerm.USER.nid(),
+                        KernelTerm.SOLOR_OVERLAY_MODULE.nid(),
+                        KernelTerm.DEVELOPMENT_PATH.nid()
+                );
+
+                // Create the concept record
+                dev.ikm.tinkar.entity.ConceptRecord conceptRecord =
+                        dev.ikm.tinkar.entity.ConceptRecord.build(
+                                newConceptUuid,
+                                stamp.versions().get(0)
+                        );
+
+                EntityService.get().putEntity(conceptRecord);
+                transaction.addComponent(conceptRecord);
+
+                // Get the NID for the newly created concept
+                long newConceptNid = EntityService.get().nidForPublicId(newConceptPublicId);
+
+                // Create a fully qualified name semantic for the concept
+                UUID fqnSemanticUuid = UUID.randomUUID();
+                SemanticRecord fqnSemantic = SemanticRecord.build(
+                        fqnSemanticUuid,
+                        KernelTerm.DESCRIPTION_PATTERN.nid(),
+                        newConceptNid,
+                        stamp.versions().get(0),
+                        Lists.immutable.of(
+                                KernelTerm.ENGLISH_LANGUAGE.publicId(),
+                                conceptName,
+                                KernelTerm.DESCRIPTION_CASE_SIGNIFICANCE.publicId(),
+                                KernelTerm.FULLY_QUALIFIED_NAME_DESCRIPTION_TYPE.publicId()
+                        )
+                );
+
+                EntityService.get().putEntity(fqnSemantic);
+                transaction.addComponent(fqnSemantic);
+
+                // Update the parent's navigation semantic to include the new child
+                // The semantic is attached to the PARENT with CHILDREN in the destination field
+                // This allows NavigationCalculator.childrenOf(parent) to find all children
+
+                // Find existing navigation semantic for the parent
+                Optional<SemanticEntity<SemanticEntityVersion>> parentNavSemantic = EntityService.get()
+                        .semanticsForComponentOfPattern(parentNid, KernelTerm.INFERRED_NAVIGATION_PATTERN.nid())
+                        .findFirst();
+
+                LongIdSet destinationSet;
+                LongIdSet originSet;
+                PublicId navSemanticId;
+
+                if (parentNavSemantic.isPresent()) {
+                    // Parent already has a navigation semantic - update it by adding the new child
+                    SemanticEntity<SemanticEntityVersion> existingSemantic = parentNavSemantic.get();
+                    navSemanticId = existingSemantic.publicId();
+
+                    // Get the existing field values
+                    SemanticEntityVersion latestVersion = existingSemantic.versions().get(
+                            existingSemantic.versions().size() - 1);
+                    LongIdSet existingDestination = (LongIdSet) latestVersion.fieldValues().get(0);
+                    LongIdSet existingOrigin = (LongIdSet) latestVersion.fieldValues().get(1);
+
+                    // Add the new child to the destination set
+                    MutableLongSet mutableDest = LongSets.mutable.of(existingDestination.toArray());
+                    mutableDest.add(newConceptNid);
+                    destinationSet = LongIds.set.of(mutableDest.toArray());
+                    originSet = existingOrigin;
+                } else {
+                    // Parent doesn't have a navigation semantic yet - create a new one
+                    navSemanticId = PublicIds.of(dev.ikm.tinkar.common.util.uuid.UuidT5Generator.singleSemanticUuid(
+                            EntityHandle.get(KernelTerm.INFERRED_NAVIGATION_PATTERN.nid()).expectPattern(),
+                            EntityHandle.get(parentNid).expectEntity()));
+                    destinationSet = LongIds.set.of(newConceptNid);
+                    originSet = LongIds.set.empty();
+                }
+
+                SemanticRecord navSemantic = navigationSemantic(
+                        navSemanticId,
+                        parentNid,  // Attached to PARENT, not child
+                        stamp.versions().get(0),
+                        Lists.immutable.of(destinationSet, originSet)
+                );
+
+                EntityService.get().putEntity(navSemantic);
+                transaction.addComponent(navSemantic);
+
+                transaction.commit();
+
+                log.info("Created new concept {} with name '{}' as descendant of {}",
+                        newConceptUuid, conceptName, parentConceptId);
+
+                // Clear caches so the new relationship is visible immediately
+                dev.ikm.tinkar.common.service.CachingService.clearAll();
+
+                // Save changes to persistent storage
+                try {
+                    saveDataStore();
+                } catch (Exception saveEx) {
+                    log.error("Failed to save changes after creating concept: {}", saveEx.getMessage(), saveEx);
+                }
+
+                return DescendantOperationResponse.success(
+                        parentConceptId,
+                        newConceptUuid.toString(),
+                        conceptName,
+                        "CREATED"
+                );
+
+            } catch (Exception e) {
+                // The commit is inside the try, so this can run after it; a committed
+                // transaction is not canceled (IKE-Network/ike-issues#1243).
+                if (transaction.isOpen()) {
+                    transaction.cancel();
+                }
+                throw e;
+            }
+
+        } catch (Exception e) {
+            log.error("Failed to create and add descendant to parent {}: {}",
+                    parentConceptId, e.getMessage(), e);
+            return DescendantOperationResponse.error(parentConceptId, null, e.getMessage());
+        }
+    }
+
+    @Override
+    public DescendantOperationResponse removeDescendant(String parentConceptId, String descendantConceptId) {
+        try {
+            PublicId parentPublicId = primitive.getPublicId(parentConceptId);
+            PublicId descendantPublicId = primitive.getPublicId(descendantConceptId);
+
+            long parentNid = EntityService.get().nidForPublicId(parentPublicId);
+            long descendantNid = EntityService.get().nidForPublicId(descendantPublicId);
+
+            log.debug("removeDescendant: parentNid={}, descendantNid={}", parentNid, descendantNid);
+
+            // Get description for the descendant
+            String descendantDescription = Calculators.View.Default()
+                    .languageCalculator()
+                    .getRegularDescriptionText(descendantNid)
+                    .orElse("Unknown concept");
+
+            // Find the navigation semantic attached to the PARENT using INFERRED pattern
+            List<SemanticEntity<SemanticEntityVersion>> parentNavSemantics = EntityService.get()
+                    .semanticsForComponentOfPattern(parentNid, KernelTerm.INFERRED_NAVIGATION_PATTERN.nid())
+                    .toList();
+
+            log.debug("removeDescendant: found {} INFERRED navigation semantics for parent", parentNavSemantics.size());
+
+            if (parentNavSemantics.isEmpty()) {
+                log.debug("removeDescendant: No navigation semantics found for parent");
+                return DescendantOperationResponse.error(
+                        parentConceptId,
+                        descendantConceptId,
+                        "No navigation relationship found between parent and descendant"
+                );
+            }
+
+            // Get the existing semantic
+            SemanticEntity<SemanticEntityVersion> existingSemantic = parentNavSemantics.get(0);
+            log.debug("removeDescendant: existingEntity type={}", existingSemantic.getClass().getSimpleName());
+
+            // Use StampCalculator to get the actual latest version (not just last in list)
+            log.debug("removeDescendant: semantic has {} versions", existingSemantic.versions().size());
+            Latest<?> latestResult = Calculators.View.Default()
+                    .stampCalculator()
+                    .latest(existingSemantic);
+
+            if (!latestResult.isPresent()) {
+                log.debug("removeDescendant: No latest version found via StampCalculator");
+                return DescendantOperationResponse.error(
+                        parentConceptId,
+                        descendantConceptId,
+                        "Could not find latest version of navigation semantic"
+                );
+            }
+
+            SemanticEntityVersion latestVersion = (SemanticEntityVersion) latestResult.get();
+            log.debug("removeDescendant: latestVersion fieldValues count={}", latestVersion.fieldValues().size());
+            Object destField = latestVersion.fieldValues().get(0);
+            log.debug("removeDescendant: destination field type={}", destField != null ? destField.getClass().getSimpleName() : "null");
+
+            if (destField == null) {
+                return DescendantOperationResponse.error(
+                        parentConceptId,
+                        descendantConceptId,
+                        "Navigation semantic field value is null"
+                );
+            }
+            LongIdSet existingDestination = (LongIdSet) destField;
+            log.debug("removeDescendant: destination set size={}, looking for descendantNid={}", existingDestination.size(), descendantNid);
+            log.debug("removeDescendant: destination set contains descendantNid? {}", existingDestination.contains(descendantNid));
+
+            if (!existingDestination.contains(descendantNid)) {
+                log.debug("removeDescendant: descendant not found in destination set");
+                return DescendantOperationResponse.error(
+                        parentConceptId,
+                        descendantConceptId,
+                        "No navigation relationship found between parent and descendant"
+                );
+            }
+
+            // Remove the descendant from the destination set
+            MutableLongSet mutableDest = LongSets.mutable.of(existingDestination.toArray());
+            mutableDest.remove(descendantNid);
+            LongIdSet newDestinationSet = LongIds.set.of(mutableDest.toArray());
+            LongIdSet existingOrigin = (LongIdSet) latestVersion.fieldValues().get(1);
+
+            // Create a new version with the updated destination set
+            long currentTime = System.currentTimeMillis();
+            Transaction transaction = Transaction.make("Remove descendant " + descendantDescription + " from parent");
+
+            try {
+                StampEntity<?> stamp = transaction.getStamp(
+                        dev.ikm.tinkar.terms.State.ACTIVE,
+                        currentTime,
+                        KernelTerm.USER.nid(),
+                        KernelTerm.SOLOR_OVERLAY_MODULE.nid(),
+                        KernelTerm.DEVELOPMENT_PATH.nid()
+                );
+
+                SemanticRecord navSemantic = navigationSemantic(
+                        existingSemantic.publicId(),
+                        parentNid,
+                        stamp.versions().get(0),
+                        Lists.immutable.of(newDestinationSet, existingOrigin)
+                );
+
+                EntityService.get().putEntity(navSemantic);
+                transaction.addComponent(navSemantic);
+                transaction.commit();
+
+                log.info("Removed {} as descendant of {}", descendantConceptId, parentConceptId);
+
+                // Clear caches so the change is visible immediately
+                dev.ikm.tinkar.common.service.CachingService.clearAll();
+
+                // Save changes to persistent storage
+                try {
+                    saveDataStore();
+                } catch (Exception saveEx) {
+                    log.error("Failed to save changes after removing descendant: {}", saveEx.getMessage(), saveEx);
+                }
+
+                return DescendantOperationResponse.success(
+                        parentConceptId,
+                        descendantConceptId,
+                        descendantDescription,
+                        "REMOVED"
+                );
+
+            } catch (Exception e) {
+                // The commit is inside the try, so this can run after it; a committed
+                // transaction is not canceled (IKE-Network/ike-issues#1243).
+                if (transaction.isOpen()) {
+                    transaction.cancel();
+                }
+                throw e;
+            }
+
+        } catch (Exception e) {
+            log.error("Failed to remove descendant {} from parent {}: {}",
+                    descendantConceptId, parentConceptId, e.getMessage(), e);
+            return DescendantOperationResponse.error(parentConceptId, descendantConceptId, e.getMessage());
+        }
+    }
+
+    /**
+     * An {@link KernelTerm#INFERRED_NAVIGATION_PATTERN} semantic with one version. When it
+     * rewrites a navigation semantic the store already holds, it keeps that semantic's whole
+     * public id: every UUID identifies it, so none may be dropped.
+     *
+     * @param semanticId   the semantic's public id
+     * @param parentNid    the concept the semantic is attached to
+     * @param stampVersion the version's stamp
+     * @param fields       the destination and origin sets
+     * @return the semantic record
+     */
+    private static SemanticRecord navigationSemantic(PublicId semanticId, long parentNid,
+                                                     StampEntityVersion stampVersion,
+                                                     org.eclipse.collections.api.list.ImmutableList<Object> fields) {
+        RecordListBuilder<SemanticVersionRecord> versionRecords = RecordListBuilder.make();
+        SemanticRecord semanticRecord = SemanticRecord.makeNew(semanticId,
+                KernelTerm.INFERRED_NAVIGATION_PATTERN.nid(), parentNid, versionRecords);
+        versionRecords.add(new SemanticVersionRecord(semanticRecord, stampVersion.stampNid(), fields)).build();
+        return semanticRecord;
+    }
+
+    // ── Admin: Import / Export / Reasoner ────────────────────────────
+
+    @Override
+    public EntityCountSummaryResponse importChangeset(File importFile, boolean useMultiPass) {
+        try {
+            EntityCountSummary summary = importChangeset(importFile, useMultiPass, null);
+            return EntityCountSummaryResponse.success(
+                    summary.conceptCount(), summary.semanticCount(),
+                    summary.patternCount(), summary.stampCount());
+        } catch (Exception e) {
+            log.error("Import failed: {}", e.getMessage(), e);
+            return EntityCountSummaryResponse.error(e.getMessage());
+        }
+    }
+
+    @Override
+    public EntityCountSummary importChangeset(File importFile, boolean useMultiPass,
+                                              TrackingListener<EntityCountSummary> progress) throws Exception {
+        log.info("Importing changeset from: {} (multiPass={})", importFile.getAbsolutePath(), useMultiPass);
+        LoadEntitiesFromProtobufFile loader = new LoadEntitiesFromProtobufFile(importFile, useMultiPass);
+        if (progress != null) {
+            loader.addListener(progress);
+        }
+        // The loader keeps the search index current itself — live for a small changeset, a rebuild
+        // past its threshold — so no second rebuild here.
+        EntityCountSummary summary = loader.compute();
+        log.info("Import complete: {} concepts, {} semantics, {} patterns, {} stamps",
+                summary.conceptCount(), summary.semanticCount(),
+                summary.patternCount(), summary.stampCount());
+
+        // Was missing: without it the import lived only in the store's write-back caches and was
+        // lost on restart, the same gap commitEntities had.
+        saveDataStore();
+        dev.ikm.tinkar.common.service.CachingService.clearAll();
+        return summary;
+    }
+
+    @Override
+    public EntityCountSummary exportEntities(File targetFile, ExportRequest request,
+                                             TrackingListener<EntityCountSummary> progress,
+                                             java.util.function.BooleanSupplier cancelled) throws Exception {
+        log.info("Exporting {} to: {}", request.describe(), targetFile.getAbsolutePath());
+        ExportEntitiesToProtobufFile exporter = switch (request.type()) {
+            case FULL -> new ExportEntitiesToProtobufFile(targetFile);
+            case TEMPORAL -> new ExportEntitiesToProtobufFile(
+                    targetFile, request.fromEpochMillis(), request.toEpochMillis());
+            case MEMBERSHIP -> new ExportEntitiesToProtobufFile(targetFile,
+                    request.membershipTagIds().stream()
+                            .map(id -> (PublicId) PublicIds.of(UUID.fromString(id.trim())))
+                            .toList());
+        };
+        if (progress != null) {
+            exporter.addListener(progress);
+        }
+        exporter.cancelWhen(cancelled);
+        EntityCountSummary summary = exporter.compute();
+        log.info("Export complete: {} concepts, {} semantics, {} patterns, {} stamps ({} bytes)",
+                summary.conceptCount(), summary.semanticCount(),
+                summary.patternCount(), summary.stampCount(), targetFile.length());
+        return summary;
+    }
+
+    @Override
+    public ReasonerResultsResponse runReasoner() {
+        try {
+            ClassifierResults results = runReasoner(ReasonerPhaseListener.NONE);
+            return ReasonerResultsResponse.from(results, lastReasonerDurationMs);
+        } catch (Exception e) {
+            log.error("Reasoner failed: {}", e.getMessage(), e);
+            return ReasonerResultsResponse.error(e.getMessage());
+        }
+    }
+
+    /** Duration of the most recent pipeline run, for the counts-only wrapper above. */
+    private volatile long lastReasonerDurationMs;
+
+    @Override
+    public ClassifierResults runReasoner(ReasonerPhaseListener listener) throws Exception {
+        return runReasoner(listener, TinkarService.newCancellationTracker());
+    }
+
+    private static void throwIfCancelled(TrackingCallable<?> tracker, String when) {
+        if (tracker.isCancelled()) {
+            throw new CancellationException("Reasoner cancelled " + when);
+        }
+    }
+
+    @Override
+    public ClassifierResults runReasoner(ReasonerPhaseListener listener, TrackingCallable<?> tracker)
+            throws Exception {
+        log.info("Starting reasoner classification pipeline...");
+        long startTime = System.currentTimeMillis();
+        try {
+            List<ReasonerService> reasonerServices = PluggableService.load(ReasonerService.class)
+                    .stream()
+                    .map(ServiceLoader.Provider::get)
+                    .sorted(Comparator.comparing(ReasonerService::getName))
+                    .toList();
+
+            if (reasonerServices.isEmpty()) {
+                throw new IllegalStateException("No ReasonerService implementation found via SPI");
+            }
+
+            ReasonerService rs = reasonerServices.getFirst();
+            log.info("Using reasoner: {}", rs.getName());
+
+            rs.init(Calculators.View.Default(),
+                    KernelTerm.EL_PLUS_PLUS_STATED_AXIOMS_PATTERN,
+                    KernelTerm.EL_PLUS_PLUS_INFERRED_AXIOMS_PATTERN);
+
+            // Phases and wording match Komet's local RunReasonerTaskBase so that a remote run
+            // performs the same work, in the same order, and reports it the same way.
+            // Checked between the steps of the first phase too: extracting and loading are the
+            // slowest part of a large run, and a cancel made then should not have to wait for the
+            // classifier to notice it.
+            rs.extractData(tracker);
+            throwIfCancelled(tracker, "while extracting data");
+            rs.loadData(tracker);
+            throwIfCancelled(tracker, "while loading data");
+            listener.onPhaseComplete(ReasonerPhaseListener.Phase.LOAD_DATA);
+
+            // The tracker-taking overload, not computeInferences(): the no-arg form fabricates a
+            // throwaway tracker that nobody can cancel, so the classification would ignore a
+            // cancel however it was requested.
+            rs.computeInferences(tracker);
+            listener.onPhaseComplete(ReasonerPhaseListener.Phase.COMPUTE_INFERENCES);
+
+            // Was missing: the pipeline went straight from inferences to writing results, so a
+            // remote classification skipped the necessary normal form that a local run in Komet
+            // always builds. Without it the written results differ from Komet's for the same data.
+            rs.buildNecessaryNormalForm(tracker);
+            listener.onPhaseComplete(ReasonerPhaseListener.Phase.BUILD_NECESSARY_NORMAL_FORM);
+
+            // The last clean abort point. Everything above is read-only; writeInferredResults
+            // stages entities into a transaction over a store other clients read, so once it
+            // starts it is allowed to finish.
+            throwIfCancelled(tracker, "before writing results");
+
+            ClassifierResults results = rs.writeInferredResults(tracker);
+            listener.onPhaseComplete(ReasonerPhaseListener.Phase.PROCESS_RESULTS);
+
+            // Clear caches so navigation queries reflect the new inferred hierarchy
+            dev.ikm.tinkar.common.service.CachingService.clearAll();
+
+            long durationMs = System.currentTimeMillis() - startTime;
+            log.info("Reasoner completed in {}ms: {} classified concepts, {} inferred changes, {} navigation changes",
+                    durationMs,
+                    results.getClassificationConceptSet().size(),
+                    results.getConceptsWithInferredChanges().size(),
+                    results.getConceptsWithNavigationChanges().size());
+
+            lastReasonerDurationMs = durationMs;
+            return results;
+        } catch (CancellationException e) {
+            // Not a failure: logged as the outcome it is, so an operator reading the log can tell
+            // a cancelled run from a broken one.
+            long durationMs = System.currentTimeMillis() - startTime;
+            lastReasonerDurationMs = durationMs;
+            log.info("Reasoner cancelled after {}ms: {}", durationMs, e.getMessage());
+            throw e;
+        } catch (Exception e) {
+            long durationMs = System.currentTimeMillis() - startTime;
+            lastReasonerDurationMs = durationMs;
+            log.error("Reasoner failed after {}ms: {}", durationMs, e.getMessage(), e);
+            throw e;
+        }
+    }
+
+    @Override
+    public CommitEntitiesResponse commitEntities(List<TinkarMsg> entities, String transactionName) {
+        long startTime = System.currentTimeMillis();
+        if (entities == null || entities.isEmpty()) {
+            return CommitEntitiesResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorMessage("No entities to commit")
+                    .setCreatedAt(startTime)
+                    .build();
+        }
+
+        String name = (transactionName == null || transactionName.isBlank())
+                ? "Remote commit of " + entities.size() + " entities"
+                : transactionName;
+        log.info("Committing {} entities from remote client: {}", entities.size(), name);
+
+        try {
+            // Decode everything before storing anything. A malformed message then fails the
+            // whole call with the store untouched, instead of leaving a half-written concept
+            // behind — the concept stored but its description missing, say. putEntity has no
+            // rollback, so this validate-then-write split is what atomicity can mean here.
+            // Allocate a NID for every incoming entity before decoding any of them. A Rocks NID
+            // encodes the owning pattern, so the store can only mint one for a PublicId it has
+            // never seen while a pattern scope is bound; unscoped, it throws. The transformer
+            // resolves NIDs as it decodes, so without this pass a brand-new concept fails with
+            // "No entity key found for UUIDs" before it is ever stored.
+            allocateNids(entities);
+
+            TinkarSchemaToEntityTransformer transformer = TinkarSchemaToEntityTransformer.getInstance();
+            List<Entity<? extends EntityVersion>> decodedEntities = new ArrayList<>();
+            List<StampEntity<StampEntityVersion>> decodedStamps = new ArrayList<>();
+            for (TinkarMsg message : entities) {
+                transformer.transform(message, decodedEntities::add, decodedStamps::add);
+            }
+
+            // Stamps first: every entity version cites its stamp by NID, so the stamp has to be
+            // resolvable before the entity citing it is stored.
+            for (StampEntity<StampEntityVersion> stamp : decodedStamps) {
+                EntityService.get().putEntity(stamp);
+            }
+            for (Entity<? extends EntityVersion> entity : decodedEntities) {
+                EntityService.get().putEntity(entity);
+            }
+
+            long commitTime = System.currentTimeMillis();
+
+            // The data provider indexes each entity inline on write, so the new concept is
+            // searchable without a rebuild; recreateLuceneIndex() is for bulk import, where
+            // inline indexing is suppressed. Caches still have to be dropped, or a query
+            // answered before this commit keeps being served.
+            dev.ikm.tinkar.common.service.CachingService.clearAll();
+
+            saveDataStore();
+
+            log.info("Committed {} entities ({} stamps) in {}ms",
+                    decodedEntities.size(), decodedStamps.size(), commitTime - startTime);
+
+            return CommitEntitiesResponse.newBuilder()
+                    .setSuccess(true)
+                    .setEntitiesCommitted(decodedEntities.size())
+                    .setCommitTime(commitTime)
+                    .setCreatedAt(commitTime)
+                    .build();
+        } catch (Exception e) {
+            log.error("Commit of {} entities failed: {}", entities.size(), e.getMessage(), e);
+            return CommitEntitiesResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorMessage(e.getMessage() == null ? e.toString() : e.getMessage())
+                    .setCreatedAt(System.currentTimeMillis())
+                    .build();
+        }
+    }
+
+    /**
+     * Reserves a NID for each entity in a commit, in dependency order.
+     *
+     * <p>Each kind is allocated through the {@code nidForXxx} helper that binds its pattern
+     * scope. Semantics come last because a semantic's NID is allocated within its pattern's
+     * scope, so a pattern arriving in the same commit has to be reserved first.
+     *
+     * <p>Idempotent for entities the store already knows: the lookup returns the existing NID
+     * before any allocation happens.
+     */
+    private void allocateNids(List<TinkarMsg> entities) {
+        for (TinkarMsg message : entities) {
+            if (message.hasStampChronology()) {
+                EntityService.get().nidForStamp(toPublicId(message.getStampChronology().getPublicId()));
+            }
+        }
+        for (TinkarMsg message : entities) {
+            if (message.hasConceptChronology()) {
+                EntityService.get().nidForConcept(toPublicId(message.getConceptChronology().getPublicId()));
+            }
+        }
+        for (TinkarMsg message : entities) {
+            if (message.hasPatternChronology()) {
+                EntityService.get().nidForPattern(toPublicId(message.getPatternChronology().getPublicId()));
+            }
+        }
+        for (TinkarMsg message : entities) {
+            if (message.hasSemanticChronology()) {
+                var semantic = message.getSemanticChronology();
+                EntityService.get().nidForSemantic(
+                        toPublicId(semantic.getPatternForSemanticPublicId()),
+                        toPublicId(semantic.getPublicId()));
+            }
+        }
+    }
+
+    /**
+     * The wire public id of a UUID given as text, for a response that reports a request it
+     * could not serve: empty when the text is not a UUID, since no UUID is written as text.
+     */
+    private static dev.ikm.tinkar.schema.PublicId protoPublicIdOrEmpty(String uuid) {
+        try {
+            return SchemaIds.toSchema(UUID.fromString(uuid));
+        } catch (IllegalArgumentException | NullPointerException notAUuid) {
+            return dev.ikm.tinkar.schema.PublicId.getDefaultInstance();
+        }
+    }
+
+    /** Converts a wire PublicId to the entity-layer one. */
+    private static PublicId toPublicId(dev.ikm.tinkar.schema.PublicId protoPublicId) {
+        return SchemaIds.toPublicId(protoPublicId);
+    }
+
+    /**
+     * Flushes the running data provider to disk.
+     *
+     * <p>Deliberately not {@link PrimitiveData#save()}. That resolves controllers through a
+     * fresh {@code ServiceLoader}, which constructs a <em>new</em> controller whose provider
+     * reference is null; its {@code save()} is then skipped by a null guard, silently, with no
+     * log. Nothing written since startup reaches disk, and the loss only shows up as an empty
+     * store after the next restart.
+     *
+     * <p>Going through the lifecycle manager reaches the instances that were actually started —
+     * discovery creates one controller per service class and starts that same object — so the
+     * save lands on the provider holding the data.
+     *
+     * <p>Matters here because the Rocks maps are write-back caches: until something calls
+     * {@code save()}, committed entities live only in memory.
+     */
+    private void saveDataStore() {
+        ServiceLifecycleManager.get()
+                .getServicesForGroup(ServiceExclusionGroup.DATA_PROVIDER)
+                .stream()
+                .filter(DataServiceController.class::isInstance)
+                .map(service -> (DataServiceController<?>) service)
+                .forEach(DataServiceController::save);
+    }
+
+    @Override
+    public ConceptCreationResponse createConcept(String fullyQualifiedName, List<String> parentConceptIds) {
+        // The simple form: one fully qualified name and a single necessary set. Delegates so
+        // there is one implementation rather than two that can drift.
+        return createConcept(new CreateConceptRequest(
+                List.of(new CreateConceptRequest.Description(
+                        fullyQualifiedName,
+                        CreateConceptRequest.DescriptionType.FULLY_QUALIFIED_NAME,
+                        null,
+                        null)),
+                List.of(new CreateConceptRequest.Axiom(
+                        CreateConceptRequest.AxiomSetType.NECESSARY,
+                        parentConceptIds == null ? List.of() : parentConceptIds))));
+    }
+
+    @Override
+    public ConceptCreationResponse createConcept(CreateConceptRequest request) {
+        List<CreateConceptRequest.Description> descriptions =
+                request == null || request.descriptions() == null ? List.of() : request.descriptions();
+
+        String fullyQualifiedName = descriptions.stream()
+                .filter(d -> d.type() == CreateConceptRequest.DescriptionType.FULLY_QUALIFIED_NAME)
+                .map(CreateConceptRequest.Description::text)
+                .findFirst()
+                .orElse(null);
+
+        String rejection = validate(descriptions, fullyQualifiedName);
+        if (rejection != null) {
+            return ConceptCreationResponse.error(fullyQualifiedName, rejection);
+        }
+
+        List<CreateConceptRequest.Axiom> axioms =
+                request.axioms() == null || request.axioms().isEmpty()
+                        ? List.of(new CreateConceptRequest.Axiom(
+                                CreateConceptRequest.AxiomSetType.NECESSARY, List.of()))
+                        : request.axioms();
+
+        log.info("Creating concept '{}' with {} description(s) and {} axiom set(s)",
+                fullyQualifiedName, descriptions.size(), axioms.size());
+
+        try {
+            // Resolve every referenced concept before writing anything, so an unknown parent
+            // fails the request rather than leaving a concept behind with a half-built axiom.
+            Map<CreateConceptRequest.Axiom, List<EntityProxy.Concept>> resolved = new LinkedHashMap<>();
+            for (CreateConceptRequest.Axiom axiom : axioms) {
+                resolved.put(axiom, resolveParents(axiom.parentConceptIds()));
+            }
+
+            UUID conceptUuid = UUID.randomUUID();
+            Transaction transaction = Transaction.make("Create concept: " + fullyQualifiedName);
+
+            StampEntity<?> stamp = transaction.getStamp(
+                    dev.ikm.tinkar.terms.State.ACTIVE,
+                    System.currentTimeMillis(),
+                    KernelTerm.USER.nid(),
+                    KernelTerm.SOLOR_OVERLAY_MODULE.nid(),
+                    KernelTerm.DEVELOPMENT_PATH.nid());
+
+            ConceptRecord conceptRecord = ConceptRecord.build(conceptUuid, stamp.versions().get(0));
+            EntityService.get().putEntity(conceptRecord);
+            transaction.addComponent(conceptRecord);
+            long conceptNid = conceptRecord.nid();
+
+            for (CreateConceptRequest.Description description : descriptions) {
+                SemanticRecord semantic = SemanticRecord.build(
+                        UUID.randomUUID(),
+                        KernelTerm.DESCRIPTION_PATTERN.nid(),
+                        conceptNid,
+                        stamp.versions().get(0),
+                        Lists.immutable.of(
+                                languageConcept(description.language()).publicId(),
+                                description.text(),
+                                caseSignificanceConcept(description.caseSignificance()).publicId(),
+                                descriptionTypeConcept(description.type()).publicId()));
+                EntityService.get().putEntity(semantic);
+                transaction.addComponent(semantic);
+            }
+
+            SemanticRecord statedAxioms = SemanticRecord.build(
+                    UUID.randomUUID(),
+                    KernelTerm.EL_PLUS_PLUS_STATED_AXIOMS_PATTERN.nid(),
+                    conceptNid,
+                    stamp.versions().get(0),
+                    Lists.immutable.of(buildStatedAxiom(resolved)));
+            EntityService.get().putEntity(statedAxioms);
+            transaction.addComponent(statedAxioms);
+
+            transaction.commit();
+            dev.ikm.tinkar.common.service.CachingService.clearAll();
+            saveDataStore();
+
+            log.info("Created concept {} '{}'", conceptUuid, fullyQualifiedName);
+            return ConceptCreationResponse.success(
+                    conceptUuid.toString(),
+                    fullyQualifiedName,
+                    resolved.values().stream()
+                            .flatMap(List::stream)
+                            .mapToLong(EntityProxy.Concept::nid)
+                            .distinct()
+                            .mapToObj(TinkarServiceImpl::identifierFor)
+                            .toList());
+        } catch (Exception e) {
+            log.error("Failed to create concept '{}': {}", fullyQualifiedName, e.getMessage(), e);
+            return ConceptCreationResponse.error(fullyQualifiedName,
+                    e.getMessage() == null ? e.toString() : e.getMessage());
+        }
+    }
+
+    /** @return why the request cannot be honoured, or null if it can. */
+    private String validate(List<CreateConceptRequest.Description> descriptions, String fullyQualifiedName) {
+        if (descriptions.isEmpty()) {
+            return "At least one description is required";
+        }
+        if (descriptions.stream().anyMatch(d -> d.type() == null)) {
+            return "Every description needs a type";
+        }
+        if (descriptions.stream().anyMatch(d -> d.text() == null || d.text().isBlank())) {
+            return "Every description needs text";
+        }
+        long fqnCount = descriptions.stream()
+                .filter(d -> d.type() == CreateConceptRequest.DescriptionType.FULLY_QUALIFIED_NAME)
+                .count();
+        if (fqnCount != 1) {
+            // Not merely "at least one": two fully qualified names would leave the concept with
+            // no single authoritative name, and every consumer picks one arbitrarily.
+            return "Exactly one FULLY_QUALIFIED_NAME description is required, found " + fqnCount;
+        }
+        return fullyQualifiedName == null ? "A fully qualified name is required" : null;
+    }
+
+    /** Resolves referenced concepts, falling back to Komet's unfinished-definition placeholder. */
+    private List<EntityProxy.Concept> resolveParents(List<String> parentConceptIds) {
+        if (parentConceptIds == null || parentConceptIds.isEmpty()) {
+            return List.of(KernelTerm.ANONYMOUS_CONCEPT);
+        }
+        List<EntityProxy.Concept> parents = new ArrayList<>();
+        for (String parentId : parentConceptIds) {
+            PublicId parentPublicId = primitive.getPublicId(parentId);
+            long parentNid = EntityService.get().nidForPublicId(parentPublicId);
+            parents.add(EntityProxy.Concept.make(EntityHandle.get(parentNid).expectEntity().publicId()));
+        }
+        return parents;
+    }
+
+    /**
+     * Builds the EL++ stated axiom tree.
+     *
+     * <p>Shape matches what Komet's editor produces, so a concept created here renders there the
+     * same way its own do:
+     * <pre>
+     *   Definition root
+     *     +- Necessary set        (or Sufficient set)
+     *          +- And
+     *               +- Concept reference (one per referenced concept)
+     * </pre>
+     * Several sets hang off the one root, which is how a concept carries necessary conditions
+     * and a sufficient definition at the same time.
+     *
+     * <p>Hand-built rather than reusing Komet's {@code AxiomBuilderRecord}: that lives in
+     * komet/framework, which this service does not depend on. The vertex primitives it uses are
+     * all in the entity layer.
+     */
+    private DiTreeEntity buildStatedAxiom(
+            Map<CreateConceptRequest.Axiom, List<EntityProxy.Concept>> axioms) {
+        DiTreeEntity.Builder treeBuilder = DiTreeEntity.builder();
+
+        EntityVertex root = EntityVertex.make(KernelTerm.DEFINITION_ROOT);
+        treeBuilder.setRoot(root);
+
+        axioms.forEach((axiom, parents) -> {
+            EntityVertex set = EntityVertex.make(setTypeConcept(axiom.setType()));
+            treeBuilder.addVertex(set);
+            treeBuilder.addEdge(set, root);
+
+            EntityVertex and = EntityVertex.make(KernelTerm.AND);
+            treeBuilder.addVertex(and);
+            treeBuilder.addEdge(and, set);
+
+            for (EntityProxy.Concept parent : parents) {
+                EntityVertex conceptReference = EntityVertex.make(KernelTerm.CONCEPT_REFERENCE);
+                conceptReference.putUncommittedProperty(KernelTerm.CONCEPT_REFERENCE.nid(), parent);
+                // putUncommittedProperty only stages the value; properties() — what the reasoner
+                // and Komet read — stays empty until it is committed. Without this the vertex was
+                // stored as a concept reference to nothing, and ElkSnomedDataBuilder failed on it.
+                conceptReference.commitProperties();
+                treeBuilder.addVertex(conceptReference);
+                treeBuilder.addEdge(conceptReference, and);
+            }
+        });
+
+        return treeBuilder.build();
+    }
+
+    private static EntityProxy.Concept setTypeConcept(CreateConceptRequest.AxiomSetType setType) {
+        return setType == CreateConceptRequest.AxiomSetType.SUFFICIENT
+                ? KernelTerm.SUFFICIENT_SET
+                : KernelTerm.NECESSARY_SET;
+    }
+
+    private static EntityProxy.Concept descriptionTypeConcept(CreateConceptRequest.DescriptionType type) {
+        return switch (type) {
+            case FULLY_QUALIFIED_NAME -> KernelTerm.FULLY_QUALIFIED_NAME_DESCRIPTION_TYPE;
+            case REGULAR_NAME -> KernelTerm.REGULAR_NAME_DESCRIPTION_TYPE;
+            case DEFINITION -> KernelTerm.DEFINITION_DESCRIPTION_TYPE;
+        };
+    }
+
+    /** Defaults to not-case-sensitive, the usual choice and what an omitted value should mean. */
+    private static EntityProxy.Concept caseSignificanceConcept(CreateConceptRequest.CaseSignificance significance) {
+        if (significance == null) {
+            return KernelTerm.DESCRIPTION_NOT_CASE_SENSITIVE;
+        }
+        return switch (significance) {
+            case CASE_SENSITIVE -> KernelTerm.DESCRIPTION_CASE_SENSITIVE;
+            case NOT_CASE_SENSITIVE -> KernelTerm.DESCRIPTION_NOT_CASE_SENSITIVE;
+            case INITIAL_CHARACTER_CASE_SENSITIVE -> KernelTerm.DESCRIPTION_INITIAL_CHARACTER_CASE_SENSITIVE;
+        };
+    }
+
+    private static EntityProxy.Concept languageConcept(CreateConceptRequest.Language language) {
+        if (language == null) {
+            return KernelTerm.ENGLISH_LANGUAGE;
+        }
+        return switch (language) {
+            case ENGLISH -> KernelTerm.ENGLISH_LANGUAGE;
+            case SPANISH -> KernelTerm.SPANISH_LANGUAGE;
+            case FRENCH -> KernelTerm.FRENCH_LANGUAGE;
+            case GERMAN -> KernelTerm.GERMAN_LANGUAGE;
+            case DUTCH -> KernelTerm.DUTCH_LANGUAGE;
+            case ITALIAN -> KernelTerm.ITALIAN_LANGUAGE;
+            case DANISH -> KernelTerm.DANISH_LANGUAGE;
+            case CZECH -> KernelTerm.CZECH_LANGUAGE;
+            case IRISH -> KernelTerm.IRISH_LANGUAGE;
+            case CHINESE -> KernelTerm.CHINESE_LANGUAGE;
+        };
+    }
+}

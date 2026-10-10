@@ -1,0 +1,521 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>network.ike.platform</groupId>
+        <artifactId>ike-parent</artifactId>
+        <version>200</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>dev.ikm.tinkar</groupId>
+    <artifactId>tinkar-service</artifactId>
+    <version>1.0.5-SNAPSHOT</version>
+    <packaging>jar</packaging>
+    <name>Tinkar Service</name>
+    <description>Standalone Spring Boot / gRPC service exposing Tinkar knowledge-graph APIs</description>
+
+    <scm>
+        <connection>scm:git:https://github.com/icaglobal/tinkar-service.git</connection>
+        <developerConnection>scm:git:git@github.com:icaglobal/tinkar-service.git</developerConnection>
+        <url>https://github.com/icaglobal/tinkar-service</url>
+        <tag>HEAD</tag>
+    </scm>
+
+    <properties>
+        <java.version>27</java.version>
+        <maven.compiler.release>${java.version}</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- External library versions -->
+        <spring-boot.version>4.0.1</spring-boot.version>
+        <grpc.version>1.78.0</grpc.version>
+        <grpc-spring-boot-starter.version>3.1.0.RELEASE</grpc-spring-boot-starter.version>
+        <!-- Used only by the dev-tls profile; ike-parent does not manage this plugin. -->
+        <exec-maven-plugin.version>3.5.0</exec-maven-plugin.version>
+        <springdoc-openapi.version>2.6.0</springdoc-openapi.version>
+        <!-- Must match the lucene-core version resolved transitively via tinkar-core's
+             search-provider module -->
+        <lucene.version>10.5.1</lucene.version>
+
+        <!-- Tinkar Core dependency version -->
+        <tinkar-core.version>1.127.7-SNAPSHOT</tinkar-core.version>
+        <!-- tinkar-schema must include Tinkar.proto in the jar (added in 1.43.0). -->
+        <tinkar-schema.version>1.43.5-SNAPSHOT</tinkar-schema.version>
+        <!-- The IKE starter set the tests load, from starter-data-ws, which builds after this repository. -->
+        <ike-starter-set.version>1-SNAPSHOT</ike-starter-set.version>
+        <!-- The nid build check (tinkar-core nid-check, IKE-Network/ike-issues#1244): how it
+             reports (error, or warning for a census), which classes may narrow a nid, and
+             javac's cap on warnings, high enough that no warning is dropped. -->
+        <nid-check.report>error</nid-check.report>
+        <nid-check.allow></nid-check.allow>
+        <javac.maxwarns>10000</javac.maxwarns>
+    </properties>
+
+    <repositories>
+        <repository>
+            <id>tinkar-nexus</id>
+            <url>https://nexus.tinkar.org/repository/ike-public/</url>
+            <releases><enabled>true</enabled></releases>
+            <snapshots><enabled>true</enabled></snapshots>
+        </repository>
+    </repositories>
+
+    <distributionManagement>
+        <!-- Explicit <site> URL — see ike-parent/CLAUDE.md
+             ("Inheriting projects MUST declare their own
+             <distributionManagement><site>") and ike-issues#380/#383. -->
+        <site>
+            <id>ike-site</id>
+            <url>https://ike.network/tinkar-service/</url>
+        </site>
+    </distributionManagement>
+
+    <dependencies>
+        <!-- Spring Boot -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+            <version>${spring-boot.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+            <version>${spring-boot.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>${springdoc-openapi.version}</version>
+        </dependency>
+
+        <!-- gRPC -->
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-netty-shaded</artifactId>
+            <version>${grpc.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-protobuf</artifactId>
+            <version>${grpc.version}</version>
+            <exclusions>
+                <!-- Exclude protobuf 3.x to use protobuf 4.x from tinkar-jpms-deps -->
+                <exclusion>
+                    <groupId>com.google.protobuf</groupId>
+                    <artifactId>protobuf-java</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-stub</artifactId>
+            <version>${grpc.version}</version>
+            <exclusions>
+                <!-- Exclude protobuf 3.x to use protobuf 4.x from tinkar-jpms-deps -->
+                <exclusion>
+                    <groupId>com.google.protobuf</groupId>
+                    <artifactId>protobuf-java</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>net.devh</groupId>
+            <artifactId>grpc-server-spring-boot-starter</artifactId>
+            <version>${grpc-spring-boot-starter.version}</version>
+        </dependency>
+
+        <!-- Protobuf - use official version to match protoc 4.30.2 generated code -->
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+            <version>4.30.2</version>
+        </dependency>
+
+        <!-- Annotations -->
+        <dependency>
+            <groupId>jakarta.annotation</groupId>
+            <artifactId>jakarta.annotation-api</artifactId>
+            <version>3.0.0</version>
+        </dependency>
+        <dependency>
+            <groupId>javax.annotation</groupId>
+            <artifactId>javax.annotation-api</artifactId>
+            <version>1.3.2</version>
+        </dependency>
+
+        <!-- Tinkar Core Modules (install tinkar-core to local Maven repo first) -->
+        <dependency>
+            <groupId>dev.ikm.tinkar</groupId>
+            <artifactId>common</artifactId>
+            <version>${tinkar-core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>dev.ikm.tinkar</groupId>
+            <artifactId>entity</artifactId>
+            <version>${tinkar-core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>dev.ikm.tinkar</groupId>
+            <artifactId>entity-provider</artifactId>
+            <version>${tinkar-core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>dev.ikm.tinkar</groupId>
+            <artifactId>data-spinedarray-provider</artifactId>
+            <version>${tinkar-core.version}</version>
+        </dependency>
+
+        <!-- Lets SearchProvider open Lucene indexes written by the previous major Lucene
+             version (e.g. codec Lucene912) instead of deleting and rebuilding them at
+             startup. Must stay in step with ${lucene.version}. -->
+        <dependency>
+            <groupId>org.apache.lucene</groupId>
+            <artifactId>lucene-backward-codecs</artifactId>
+            <version>${lucene.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Rocks KB Engine -->
+        <dependency>
+            <groupId>dev.ikm.ike</groupId>
+            <artifactId>rocks-kb-engine</artifactId>
+            <!-- rocks-kb sub-module: the release plan tracks member root
+                 artifacts only, so this literal never retargets — keep it
+                 at the version rocks-kb releases this cycle (1022 gate). -->
+            <version>0.1.5-SNAPSHOT</version>
+        </dependency>
+        <!-- RocksDB platform-specific natives; classifier set by OS profile below -->
+        <dependency>
+            <groupId>dev.ikm.jpms</groupId>
+            <artifactId>rocksdbjni</artifactId>
+            <version>10.4.2-r2</version>
+            <classifier>${rocksdbjni.classifier}</classifier>
+        </dependency>
+
+        <!-- Reasoner -->
+        <dependency>
+            <groupId>dev.ikm.tinkar</groupId>
+            <artifactId>reasoner-service</artifactId>
+            <version>${tinkar-core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>dev.ikm.tinkar</groupId>
+            <artifactId>reasoner-elk-snomed</artifactId>
+            <version>${tinkar-core.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>dev.ikm.tinkar</groupId>
+            <artifactId>executor-provider</artifactId>
+            <version>${tinkar-core.version}</version>
+        </dependency>
+
+        <!-- Testing -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <version>${spring-boot.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- The IKE starter set's bindings (IkeTerms) for the components the tests name beyond the kernel. -->
+        <dependency>
+            <groupId>network.ike.foundation</groupId>
+            <artifactId>ike-bindings</artifactId>
+            <version>${ike-starter-set.version}</version>
+            <scope>test</scope>
+            <exclusions>
+                <!-- The knowledge-bindings goal's forked runtime, not the bindings' consumers': through
+                     a snapshot outside the reactor it reaches ike-knowledge-provider 7-SNAPSHOT, which the
+                     sorter cannot order before this module (IkeKometWs_ReactorTest #155, #156). -->
+                <exclusion>
+                    <groupId>network.ike.knowledge</groupId>
+                    <artifactId>ike-knowledge-provider</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- Static analysis -->
+        <dependency>
+            <groupId>com.github.spotbugs</groupId>
+            <artifactId>spotbugs-annotations</artifactId>
+            <version>4.9.8</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- The shared test logging configuration (log4j2-test.xml); a library ships none of its own. -->
+        <dependency>
+            <groupId>dev.ikm.tinkar</groupId>
+            <artifactId>test-logging</artifactId>
+            <version>${tinkar-core.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-jul</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <profiles>
+        <!-- Selects the platform-specific RocksDB native jar classifier. -->
+        <profile>
+            <id>macos-arm</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                    <arch>aarch64</arch>
+                </os>
+            </activation>
+            <properties>
+                <rocksdbjni.classifier>osx</rocksdbjni.classifier>
+            </properties>
+        </profile>
+        <profile>
+            <id>macos-x86</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                    <arch>x86_64</arch>
+                </os>
+            </activation>
+            <properties>
+                <rocksdbjni.classifier>osx</rocksdbjni.classifier>
+            </properties>
+        </profile>
+        <profile>
+            <id>linux</id>
+            <activation>
+                <os>
+                    <family>unix</family>
+                    <name>Linux</name>
+                </os>
+            </activation>
+            <properties>
+                <rocksdbjni.classifier>linux64</rocksdbjni.classifier>
+            </properties>
+        </profile>
+        <profile>
+            <id>windows</id>
+            <activation>
+                <os>
+                    <family>windows</family>
+                </os>
+            </activation>
+            <properties>
+                <rocksdbjni.classifier>win64</rocksdbjni.classifier>
+            </properties>
+        </profile>
+
+        <!--
+            Local TLS development. Generates a self-signed certificate if one is
+            not already present, then leaves it alone on later runs:
+
+                ./mvnw -Pdev-tls spring-boot:run
+
+            Opt-in rather than always-on so ordinary builds neither require
+            openssl nor pay for a process fork. The certificate itself is
+            gitignored; see scripts/generate-dev-cert.sh for the trust model and
+            the environment variables the server and client each need.
+
+            The logic lives in the script, not here — embedding shell in a POM is
+            prohibited by the IKE build standards, and the script has to be
+            runnable standalone anyway.
+        -->
+        <profile>
+            <id>dev-tls</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>${exec-maven-plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>generate-dev-tls-certificate</id>
+                                <phase>generate-resources</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>${project.basedir}/scripts/generate-dev-cert.sh</executable>
+                                    <workingDirectory>${project.basedir}</workingDirectory>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>3.8.1</version>
+                <executions>
+                    <execution>
+                        <id>unpack-tinkar-schema-proto</id>
+                        <phase>initialize</phase>
+                        <goals>
+                            <goal>unpack</goal>
+                        </goals>
+                        <configuration>
+                            <artifactItems>
+                                <artifactItem>
+                                    <groupId>dev.ikm.tinkar</groupId>
+                                    <artifactId>tinkar-schema</artifactId>
+                                    <version>${tinkar-schema.version}</version>
+                                    <includes>Tinkar.proto</includes>
+                                    <outputDirectory>${project.build.directory}/proto-deps</outputDirectory>
+                                </artifactItem>
+                                <!-- Every service schema is owned by tinkar-schema and compiled here
+                                     rather than checked in, so this project and the other consumer
+                                     cannot drift. Unpacked to its own directory, which is added to
+                                     BOTH sourceDirectories (to generate stubs) and importPaths (so
+                                     inter-proto imports resolve by their bare names). -->
+                                <artifactItem>
+                                    <groupId>dev.ikm.tinkar</groupId>
+                                    <artifactId>tinkar-schema</artifactId>
+                                    <version>${tinkar-schema.version}</version>
+                                    <includes>proto/*.proto</includes>
+                                    <outputDirectory>${project.build.directory}/proto-downstream</outputDirectory>
+                                </artifactItem>
+                            </artifactItems>
+                        </configuration>
+                    </execution>
+                    <!-- Copy the IKE starter set into target/data so the store-backed tests
+                         can load it into an ephemeral store (the same artifact and file name
+                         komet/framework and komet-claude-plugin use:
+                         target/data/ike-starter-set-reasoned-pb.zip). -->
+                    <execution>
+                        <id>copy-starter-data</id>
+                        <phase>process-test-resources</phase>
+                        <goals>
+                            <goal>copy</goal>
+                        </goals>
+                        <configuration>
+                            <artifactItems>
+                                <artifactItem>
+                                    <groupId>network.ike.foundation</groupId>
+                                    <artifactId>ike-starter-set</artifactId>
+                                    <version>${ike-starter-set.version}</version>
+                                    <classifier>reasoned-pb</classifier>
+                                    <type>zip</type>
+                                    <overWrite>false</overWrite>
+                                    <outputDirectory>${project.build.directory}/data</outputDirectory>
+                                    <destFileName>ike-starter-set-reasoned-pb.zip</destFileName>
+                                </artifactItem>
+                            </artifactItems>
+                            <stripVersion>true</stripVersion>
+                            <outputDirectory>${project.build.directory}/data</outputDirectory>
+                            <overWriteReleases>false</overWriteReleases>
+                            <!-- Copy only when the installed starter set is newer than the copy here, rather than
+                                 overwriting it on every build. -->
+                            <overWriteSnapshots>false</overWriteSnapshots>
+                            <overWriteIfNewer>true</overWriteIfNewer>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>io.github.ascopes</groupId>
+                <artifactId>protobuf-maven-plugin</artifactId>
+                <version>3.2.0</version>
+                <configuration>
+                    <protocVersion>4.30.2</protocVersion>
+                    <sourceDirectories>
+                        <sourceDirectory>${project.build.directory}/proto-downstream/proto</sourceDirectory>
+                    </sourceDirectories>
+                    <importPaths>
+                        <importPath>${project.build.directory}/proto-deps</importPath>
+                        <importPath>${project.build.directory}/proto-downstream/proto</importPath>
+                    </importPaths>
+                    <binaryMavenPlugins>
+                        <binaryMavenPlugin>
+                            <groupId>io.grpc</groupId>
+                            <artifactId>protoc-gen-grpc-java</artifactId>
+                            <version>${grpc.version}</version>
+                        </binaryMavenPlugin>
+                    </binaryMavenPlugins>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>generate</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.14.1</version>
+                <configuration>
+                    <parameters>true</parameters>
+                    <compilerArgs>
+                        <arg>--enable-preview</arg>
+                        <!-- The nid build check (tinkar-core nid-check, IKE-Network/ike-issues#1244). -->
+                        <arg>-Xplugin:NidCheck report=${nid-check.report} allow=${nid-check.allow}</arg>
+                        <arg>-Xmaxwarns</arg>
+                        <arg>${javac.maxwarns}</arg>
+                        <arg>-Xmaxerrs</arg>
+                        <arg>10000</arg>
+                    </compilerArgs>
+                    <annotationProcessorPaths combine.children="append">
+                        <path>
+                            <groupId>dev.ikm.tinkar</groupId>
+                            <artifactId>nid-check</artifactId>
+                            <version>${tinkar-core.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>${spring-boot.version}</version>
+                <configuration>
+                    <jvmArguments>
+                        --enable-preview
+                    </jvmArguments>
+                    <includeSystemScope>true</includeSystemScope>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.3</version>
+                <configuration>
+                    <!-- Lucene 10.5.1 turns its Vector API code on only up to Java 26 and warns on 27.
+                         The property raises that limit; the full suite passes with it. Drop it when
+                         a Lucene release supports Java 27. -->
+                    <argLine>@{argLine} --enable-preview --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow -Djava.util.logging.manager=org.apache.logging.log4j.jul.LogManager -Dnet.bytebuddy.experimental=true
+                        --add-modules jdk.incubator.vector -Dorg.apache.lucene.vectorization.upperJavaFeatureVersion=27</argLine>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>com.github.spotbugs</groupId>
+                <artifactId>spotbugs-maven-plugin</artifactId>
+                <version>4.9.8.3</version>
+                <configuration>
+                    <effort>Max</effort>
+                    <threshold>Medium</threshold>
+                    <excludeFilterFile>${project.basedir}/spotbugs-exclude.xml</excludeFilterFile>
+                    <xmlOutput>true</xmlOutput>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

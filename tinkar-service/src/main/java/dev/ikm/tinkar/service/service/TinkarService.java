@@ -1,0 +1,400 @@
+package dev.ikm.tinkar.service.service;
+
+import dev.ikm.tinkar.service.dto.ChangeHistoryResponse;
+import dev.ikm.tinkar.service.dto.ConceptChangeHistoryResponse;
+import dev.ikm.tinkar.service.dto.ConceptCreationResponse;
+import dev.ikm.tinkar.service.dto.CreateConceptRequest;
+import dev.ikm.tinkar.service.dto.ConceptSearchResponse;
+import dev.ikm.tinkar.service.dto.ConceptSemanticsResponse;
+import dev.ikm.tinkar.service.dto.DescendantOperationResponse;
+import dev.ikm.tinkar.service.dto.EntityCountSummaryResponse;
+import dev.ikm.tinkar.service.dto.ReasonerResultsResponse;
+import dev.ikm.tinkar.service.dto.SearchSortOption;
+import dev.ikm.tinkar.schema.TinkarMsg;
+import dev.ikm.tinkar.service.proto.CommitEntitiesResponse;
+import dev.ikm.tinkar.service.proto.TinkarConceptSemanticsResponse;
+import dev.ikm.tinkar.service.proto.TinkarSearchQueryResponse;
+import dev.ikm.tinkar.service.proto.TinkarSemanticInfoResponse;
+import dev.ikm.tinkar.common.service.TrackingCallable;
+import dev.ikm.tinkar.coordinate.view.calculator.ViewCalculatorWithCache;
+
+import java.io.File;
+import java.util.List;
+
+public interface TinkarService {
+    TinkarSearchQueryResponse search(String query);
+
+    TinkarSearchQueryResponse conceptSearch(String query, Integer maxResults);
+
+    /**
+     * Searches for concepts with configurable sort options.
+     * Supports both grouped (by top component) and flat (by semantic match) result structures.
+     *
+     * Sort options:
+     * - TOP_COMPONENT: Groups results by concept, sorted by relevance score (highest first)
+     * - TOP_COMPONENT_ALPHA: Groups results by concept, sorted alphabetically
+     * - SEMANTIC: Flat list of semantic matches, sorted by relevance score (highest first)
+     * - SEMANTIC_ALPHA: Flat list of semantic matches, sorted alphabetically
+     *
+     * @param query The search query string
+     * @param maxResults Maximum number of results to return
+     * @param sortBy The sort option to use (defaults to TOP_COMPONENT if null)
+     * @return ConceptSearchResponse containing search results in the requested format
+     */
+    ConceptSearchResponse conceptSearchWithSort(String query, Integer maxResults, SearchSortOption sortBy);
+
+    TinkarSearchQueryResponse getEntity(String conceptId);
+
+    TinkarSearchQueryResponse getChildConcepts(String conceptId);
+
+    /**
+     * Gets direct child concepts using the specified view calculator for coordinate resolution.
+     * The navigation coordinate (premise type) controls whether stated or inferred relationships are used.
+     * @param conceptId The public ID (UUID) of the parent concept
+     * @param viewCalculator The view calculator with coordinate overrides
+     * @return TinkarSearchQueryResponse containing child concepts
+     */
+    TinkarSearchQueryResponse getChildConcepts(String conceptId, ViewCalculatorWithCache viewCalculator);
+
+    TinkarSearchQueryResponse getDescendantConcepts(String conceptId);
+
+    /**
+     * Gets all descendant concepts (full subtree) using the specified view calculator for coordinate resolution.
+     * The navigation coordinate (premise type) controls whether stated or inferred relationships are used.
+     * @param conceptId The public ID (UUID) of the parent concept
+     * @param viewCalculator The view calculator with coordinate overrides
+     * @return TinkarSearchQueryResponse containing descendant concepts
+     */
+    TinkarSearchQueryResponse getDescendantConcepts(String conceptId, ViewCalculatorWithCache viewCalculator);
+
+    TinkarSearchQueryResponse getLIDRRecordConceptsFromTestKit(String conceptId);
+
+    TinkarSearchQueryResponse getResultConformanceConceptsFromLIDRRecord(String conceptId);
+
+    TinkarSearchQueryResponse getAllowedResultConceptsFromResultConformance(String conceptId);
+
+    /**
+     * Rebuilds the Lucene search index. This operation is asynchronous and may take some time.
+     * @return A message indicating that the rebuild process has started
+     */
+    String rebuildSearchIndex();
+
+    /**
+     * Gets the change history for an entity, showing all version changes and field modifications.
+     * This demonstrates IKE-Flow change tracking capabilities.
+     * @param entityId The public ID (UUID) of the entity
+     * @return ChangeHistoryResponse containing the chronology of changes
+     */
+    ChangeHistoryResponse getChangeHistory(String entityId);
+
+    /**
+     * Gets the change history for an entity using the specified view calculator for coordinate resolution.
+     * @param entityId The public ID (UUID) of the entity
+     * @param viewCalculator The view calculator with coordinate overrides
+     * @return ChangeHistoryResponse containing the chronology of changes
+     */
+    ChangeHistoryResponse getChangeHistory(String entityId, ViewCalculatorWithCache viewCalculator);
+
+    /**
+     * Creates a sample semantic modification on an existing concept to demonstrate change tracking.
+     * This creates a new comment/annotation semantic on the specified concept.
+     * @param conceptId The public ID (UUID) of the concept to annotate
+     * @param comment The comment text to add as an annotation
+     * @return ChangeHistoryResponse showing the change that was made
+     */
+    ChangeHistoryResponse createSampleChange(String conceptId, String comment);
+
+    /**
+     * Gets all comment semantics attached to a concept.
+     * @param conceptId The public ID (UUID) of the concept
+     * @return ConceptSemanticsResponse containing all comments for this concept
+     */
+    ConceptSemanticsResponse getConceptComments(String conceptId);
+
+    /**
+     * Gets all comment semantics attached to a concept using the specified view calculator.
+     * @param conceptId The public ID (UUID) of the concept
+     * @param viewCalculator The view calculator with coordinate overrides
+     * @return ConceptSemanticsResponse containing all comments for this concept
+     */
+    ConceptSemanticsResponse getConceptComments(String conceptId, ViewCalculatorWithCache viewCalculator);
+
+    /**
+     * Gets all semantics of any pattern attached to a concept.
+     * @param conceptId The public ID (UUID) of the concept
+     * @return ConceptSemanticsResponse containing all semantics for this concept
+     */
+    ConceptSemanticsResponse inspectConcept(String conceptId);
+
+    /**
+     * Gets all semantics of any pattern attached to a concept using the specified view calculator.
+     * @param conceptId The public ID (UUID) of the concept
+     * @param viewCalculator The view calculator with coordinate overrides
+     * @return ConceptSemanticsResponse containing all semantics for this concept
+     */
+    ConceptSemanticsResponse inspectConcept(String conceptId, ViewCalculatorWithCache viewCalculator);
+
+    /**
+     * Gets all semantics of any pattern attached to a concept (gRPC proto response).
+     * @param conceptId The public ID (UUID) of the concept
+     * @return TinkarConceptSemanticsResponse proto containing all semantics for this concept
+     */
+    TinkarConceptSemanticsResponse inspectConceptProto(String conceptId);
+
+    /**
+     * Gets all semantics of any pattern attached to a concept (gRPC proto response) using the specified view calculator.
+     * @param conceptId The public ID (UUID) of the concept
+     * @param viewCalculator The view calculator with coordinate overrides
+     * @return TinkarConceptSemanticsResponse proto containing all semantics for this concept
+     */
+    TinkarConceptSemanticsResponse inspectConceptProto(String conceptId, ViewCalculatorWithCache viewCalculator);
+
+    /**
+     * Gets the field values, pattern name, and STAMP info for a single semantic instance, fetched
+     * by the semantic's own public ID (not the concept it's attached to).
+     * @param semanticId The public ID (UUID) of the semantic instance
+     * @return TinkarSemanticInfoResponse proto containing the semantic's field-level detail
+     */
+    TinkarSemanticInfoResponse getSemanticInfo(String semanticId);
+
+    /**
+     * Gets the field values, pattern name, and STAMP info for a single semantic instance using the
+     * specified view calculator.
+     * @param semanticId The public ID (UUID) of the semantic instance
+     * @param viewCalculator The view calculator with coordinate overrides
+     * @return TinkarSemanticInfoResponse proto containing the semantic's field-level detail
+     */
+    TinkarSemanticInfoResponse getSemanticInfo(String semanticId, ViewCalculatorWithCache viewCalculator);
+
+    /**
+     * Returns the full entity graph for a concept as a list of serialized {@code TinkarMsg} objects.
+     * Includes the concept itself, all attached semantics, their patterns, and all referenced stamps.
+     * The caller can load these entities into a local entity store (e.g. an ephemeral provider) and
+     * then use the standard concept detail view to display the concept.
+     *
+     * @param conceptId a UUID string of the concept's public ID (any of its UUIDs identifies it)
+     * @return TinkarConceptEntityResponse containing all TinkarMsg entities
+     */
+    dev.ikm.tinkar.service.proto.TinkarConceptEntityResponse loadConceptEntityGraph(String conceptId);
+
+    /**
+     * Returns a single entity plus its version stamps as {@code TinkarMsg} objects.
+     * Used by {@code GrpcPrimitiveDataService} as a cache-miss fallback: when an entity is not
+     * already in the local in-memory store, this call fetches just that entity (not a full concept
+     * graph) so the client can cache and return the bytes.
+     *
+     * @param entityId a UUID string of the entity's public ID (any of its UUIDs identifies it)
+     * @return TinkarConceptEntityResponse containing the entity and its stamps
+     */
+    dev.ikm.tinkar.service.proto.TinkarConceptEntityResponse getEntityByPublicId(String entityId);
+
+    /**
+     * Gets comprehensive change history for a concept including all attached semantics.
+     * This shows changes to the concept itself AND changes to all comments, descriptions, etc.
+     * @param conceptId The public ID (UUID) of the concept
+     * @return ConceptChangeHistoryResponse containing the full change history
+     */
+    ConceptChangeHistoryResponse getConceptChangeHistory(String conceptId);
+
+    /**
+     * Gets comprehensive change history for a concept including all attached semantics,
+     * using the specified view calculator for coordinate resolution.
+     * @param conceptId The public ID (UUID) of the concept
+     * @param viewCalculator The view calculator with coordinate overrides
+     * @return ConceptChangeHistoryResponse containing the full change history
+     */
+    ConceptChangeHistoryResponse getConceptChangeHistory(String conceptId, ViewCalculatorWithCache viewCalculator);
+
+    /**
+     * Saves all pending changes to persistent storage (disk).
+     * Changes made via createSampleChange are held in memory until this method is called.
+     * This supports a review workflow where changes can be reviewed before being committed to disk.
+     * @return A message indicating the save result
+     */
+    String saveChanges();
+
+    /**
+     * Discards all pending changes that have not been saved to disk.
+     * This effectively reverts any changes made since the last save or server start.
+     * Note: This requires a data reload to take effect.
+     * @return A message indicating the discard result
+     */
+    String discardChanges();
+
+    /**
+     * Creates a new descendant relationship between a parent concept and an existing concept.
+     * This adds an IS-A relationship making the descendant a child of the parent.
+     * @param parentConceptId The public ID (UUID) of the parent concept
+     * @param descendantConceptId The public ID (UUID) of the concept to make a descendant
+     * @return DescendantOperationResponse indicating success or failure
+     */
+    DescendantOperationResponse addDescendant(String parentConceptId, String descendantConceptId);
+
+    /**
+     * Creates a new concept with the given name and adds it as a descendant of the parent concept.
+     * This is a convenience method that creates both the concept and the IS-A relationship.
+     * @param parentConceptId The public ID (UUID) of the parent concept
+     * @param conceptName The fully qualified name for the new concept
+     * @return DescendantOperationResponse containing the newly created concept's ID
+     */
+    DescendantOperationResponse createAndAddDescendant(String parentConceptId, String conceptName);
+
+    /**
+     * Removes a descendant relationship between a parent concept and a descendant concept.
+     * This removes the IS-A relationship making the descendant no longer a child of the parent.
+     * @param parentConceptId The public ID (UUID) of the parent concept
+     * @param descendantConceptId The public ID (UUID) of the descendant concept to remove
+     * @return DescendantOperationResponse indicating success or failure
+     */
+    DescendantOperationResponse removeDescendant(String parentConceptId, String descendantConceptId);
+
+    // ── Admin: Import / Export / Reasoner ────────────────────────────
+
+    /**
+     * Imports a Tinkar changeset from a protobuf ZIP file.
+     * @param importFile the ZIP file containing delimited TinkarMsg protobuf + manifest
+     * @param useMultiPass if true, use multi-pass import to resolve forward references
+     * @return EntityCountSummaryResponse with counts of imported entities
+     */
+    EntityCountSummaryResponse importChangeset(File importFile, boolean useMultiPass);
+
+    /**
+     * Imports a changeset, reporting progress, and persists what it imported.
+     *
+     * <p>Not cancellable, deliberately: an import stopped part way leaves some of its entities
+     * written. Importing merges versions, so re-running a file is safe, but nothing should be left
+     * half imported by choice.
+     *
+     * @param progress notified as the loader advances; may be null
+     * @return the counts of what was imported
+     * @throws Exception if the file cannot be read or any entity in it fails to import
+     */
+    dev.ikm.tinkar.common.service.EntityCountSummary importChangeset(
+            File importFile, boolean useMultiPass,
+            dev.ikm.tinkar.common.service.TrackingListener<dev.ikm.tinkar.common.service.EntityCountSummary> progress)
+            throws Exception;
+
+    /**
+     * Exports entities to {@code targetFile} as a changeset zip — the format the import reads, and
+     * the one Komet's Export Dataset writes.
+     *
+     * @param request which entities; must already be {@link dev.ikm.tinkar.service.dto.ExportRequest#validate() valid}
+     * @param progress notified as the export advances; may be null
+     * @param cancelled polled during the export; once true it stops and throws
+     *                  {@link java.util.concurrent.CancellationException}. May be null
+     * @return the counts of what was written
+     * @throws Exception if the export fails; the partial file is the caller's to remove
+     */
+    dev.ikm.tinkar.common.service.EntityCountSummary exportEntities(
+            File targetFile, dev.ikm.tinkar.service.dto.ExportRequest request,
+            dev.ikm.tinkar.common.service.TrackingListener<dev.ikm.tinkar.common.service.EntityCountSummary> progress,
+            java.util.function.BooleanSupplier cancelled)
+            throws Exception;
+
+    /**
+     * Runs the full reasoner classification pipeline:
+     * init -> extractData -> loadData -> computeInferences -> writeInferredResults.
+     * @return ReasonerResultsResponse with classification results
+     */
+    ReasonerResultsResponse runReasoner();
+
+    /**
+     * Runs the reasoner pipeline, reporting each phase as it completes, and returns the full
+     * classification results rather than a summary of counts.
+     *
+     * <p>{@link #runReasoner()} is this method with a no-op listener, its results reduced to
+     * counts. Callers that need the classified concepts themselves — to show which concepts
+     * changed, not merely how many — use this.
+     *
+     * @param listener notified per phase; use {@link ReasonerPhaseListener#NONE} for none
+     * @return the classification results
+     * @throws Exception if any phase of the pipeline fails
+     */
+    dev.ikm.tinkar.reasoner.service.ClassifierResults runReasoner(ReasonerPhaseListener listener)
+            throws Exception;
+
+    /**
+     * Runs the reasoner, reporting phases and honouring cancellation through {@code tracker}.
+     *
+     * <p>Cancelling stops the run at the next point it is safe to: the classification is
+     * interrupted mid-flight, and the pipeline aborts before writing anything. Once
+     * <em>writing</em> inferred results has begun it runs to completion regardless — a partially
+     * written classification in a shared store is worse than a slow cancel, because nothing
+     * downstream can tell it is partial.
+     *
+     * @param listener notified per phase; use {@link ReasonerPhaseListener#NONE} for none
+     * @param tracker  cancel it to stop the run; from {@link #newCancellationTracker()}
+     * @return the classification results
+     * @throws java.util.concurrent.CancellationException if the run was cancelled before writing
+     * @throws Exception if any phase fails
+     */
+    dev.ikm.tinkar.reasoner.service.ClassifierResults runReasoner(
+            ReasonerPhaseListener listener, TrackingCallable<?> tracker) throws Exception;
+
+    /**
+     * A tracker to hand {@link #runReasoner(ReasonerPhaseListener, TrackingCallable)} and keep,
+     * so the caller can cancel the run by calling {@code cancel()} on it.
+     *
+     * <p>The reasoner phases already take a {@code TrackingCallable} for progress, so the handle
+     * that cancels a run is the same object that carries it — there is no second mechanism to
+     * keep in step.
+     */
+    static TrackingCallable<?> newCancellationTracker() {
+        return new TrackingCallable<Object>() {
+            @Override
+            protected Object compute() {
+                return null;
+            }
+        };
+    }
+
+    /**
+     * Commits client-authored entities to this store as a single transaction.
+     *
+     * <p>The write counterpart to {@link #getEntityByPublicId(String)}: a client whose store is
+     * remote has nowhere durable to put an edit, so it sends the entities its own transaction
+     * produced and this commits them together.
+     *
+     * <p>Entities arrive carrying PublicIds rather than NIDs, because a NID is assigned per
+     * store and the client's are meaningless here. Each is resolved against this store, which
+     * assigns new NIDs for entities it has not seen.
+     *
+     * <p>All-or-nothing: if any entity fails to transform or store, nothing is committed, so a
+     * half-written concept never reaches the store.
+     *
+     * @param entities        the complete set of entities in one client transaction
+     * @param transactionName names the transaction for audit; blank to let this pick one
+     * @return the outcome, including the server-assigned commit time
+     */
+    CommitEntitiesResponse commitEntities(List<TinkarMsg> entities, String transactionName);
+
+    /**
+     * Creates a concept with a fully qualified name and an EL++ stated axiom.
+     *
+     * <p>Mirrors what Komet's "New Concept" editor writes, so a concept created here is
+     * indistinguishable from one authored in the client: a concept, a fully-qualified-name
+     * description, and a stated axiom whose necessary set references {@code parentConceptIds}.
+     *
+     * <p>An empty {@code parentConceptIds} yields a necessary set referencing
+     * {@code ANONYMOUS_CONCEPT} — the placeholder Komet uses for a definition that is not
+     * finished yet, rather than a concept with no axiom at all.
+     *
+     * @param fullyQualifiedName the concept's fully qualified name; required
+     * @param parentConceptIds   public IDs (UUIDs) the necessary set references; may be empty
+     * @return the created concept's public ID, or the reason it could not be created
+     */
+    ConceptCreationResponse createConcept(String fullyQualifiedName, List<String> parentConceptIds);
+
+    /**
+     * Creates a concept from a full specification of its descriptions and axioms.
+     *
+     * <p>The general form of {@link #createConcept(String, List)}, which is this with one
+     * fully-qualified-name description and a single necessary set. Mirrors what Komet's New
+     * Concept editor can author: several descriptions, each with its own type, language and case
+     * significance, and a stated axiom that may carry necessary and sufficient sets together.
+     *
+     * @param request the concept to create; requires exactly one FULLY_QUALIFIED_NAME description
+     * @return the created concept's public ID, or the reason it could not be created
+     */
+    ConceptCreationResponse createConcept(CreateConceptRequest request);
+}
