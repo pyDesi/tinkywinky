@@ -1,0 +1,16 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "wTHsda7YVyv26Q93v4OvU"
+uri = "file://docs/images/workbench-device-review.webp"
+type = "image"
+title = "Tinkar Workbench — live results preview"
+description = "Repository-ready screenshot of the twelve-device scenario with real results, embedded in the GitHub README."
+logical_id = "ff440ac1-0051-414d-9b75-d0bebce29320"
+content_hash = "sha256:f4353ccda8852ca38eef71319b5a9eea46e1b35c3b8742a0ee00a052175bb3b2"
+size = 116912
+mtime_ms = 1794263836396
+storage_uri = "gcs://replit-rams-assets-riker/rams/assets/repl:5866bfed-93d3-4c2a-9d1a-9fedc5568403/ff440ac1-0051-414d-9b75-d0bebce29320/442bd69f-31bd-4360-bb7d-d418408a4e02"
+storage_version_token = "1794263869251813"
+content_type = "image/webp"

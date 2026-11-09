@@ -19,6 +19,35 @@ The project demonstrates three upstream DeX scenarios against the public GUDID s
 
 The workbench does not save coordinates, import data, edit concepts, or run the reasoner. Its Python runner enforces a positive allowlist of read-only RPCs.
 
+## UI Preview
+
+These screenshots were captured from real, read-only scenario runs on **November 9, 2026**. They are static previews, not an interactive GitHub-hosted demo. Results depend on the loaded dataset and search queries.
+
+### Twelve-device review
+
+The review shows all twelve requested fixtures, with nine matching records retrieved and three requests without a matching candidate. Each row exposes identifier availability, semantic and STAMP counts, and REST/gRPC search parity.
+
+![Tinkar Workbench twelve-device review showing nine matching records, three missing candidates, and REST/gRPC search parity](docs/images/workbench-device-review.webp)
+
+### Device inspection
+
+Selecting a row opens its returned candidate name, public UUIDs, semantic patterns, and decoded payloads. The requested fixture and returned name are shown separately: the candidate pictured below is an AMR kit returned by the Panther Fusion search, **not a verified match for the requested respiratory assay**.
+
+![Tinkar Workbench respiratory-device inspection showing the requested fixture, returned candidate, UUID, semantic patterns, and payload tabs](docs/images/workbench-device-inspection.webp)
+
+### Contributor walkthrough
+
+With the services running as described in [Getting started](#getting-started):
+
+1. Open the root workbench preview and check the service availability indicator.
+2. Select **Run all in sequence**, or use **Run** on an individual case.
+3. Review **Found**, **Missing**, and **Errors**. Found means a terminology record was retrieved—not that clinical DeX data is complete.
+4. Filter by device label, UUID, or pattern, or select the **found**, **missing**, or **error** filter.
+5. Select a device row to compare the requested and returned names, inspect identifiers and patterns, and switch between the **semantic**, **search**, and **rest** payload tabs.
+6. Use **CSV** to download the currently filtered table, or **JSON** for the full selected case result. Follow **Swagger UI** or **API docs** to explore the underlying service.
+
+The workbench source is in [`artifacts/tinkar-workbench/`](artifacts/tinkar-workbench/). Screenshots are stored in [`docs/images/`](docs/images/) so GitHub can display them directly from the repository, without depending on a running development workspace.
+
 ## The three scenarios
 
 | Case | Purpose | Requested devices |
