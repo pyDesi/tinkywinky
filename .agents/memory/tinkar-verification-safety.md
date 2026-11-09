@@ -16,3 +16,8 @@ runs belong on a disposable listener/store, even if named “read-only” or gat
 markers. Never infer live client compatibility from mock tests or success flags:
 protocol drift can silently discard identifiers. See TINKAR-VERIFICATION.md for
 the recorded verification and mismatch evidence.
+
+Distinguish a missing optional identifier in the server's own response from a
+client decoder losing an identifier that was present on the wire. Preserve
+source-level absence explicitly; never reconstruct an identifier from its
+human-readable label or accept an empty required record ID as a successful decode.

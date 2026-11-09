@@ -1,0 +1,48 @@
+[project]
+name = "tinkar-python"
+version = "0.1.0"
+description = "Python gRPC client for the Tinkar terminology service"
+readme = "README.md"
+requires-python = ">=3.13"
+authors = [{ name = "jmaslek", email = "jmaslek@ica.ai" }]
+keywords = ["tinkar", "terminology", "grpc", "ikmdev", "healthcare", "snomed"]
+# TODO: confirm and set the project license (e.g. license = "Apache-2.0") and
+# the canonical repository URL under [project.urls] before publishing.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Healthcare Industry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Typing :: Typed",
+]
+dependencies = [
+    "grpcio>=1.81.0",
+    "protobuf>=6.33.5",
+    "pydantic>=2.12.5",
+]
+
+[tool.uv.build-backend]
+module-name = "tinkar"
+
+[build-system]
+requires = ["uv_build>=0.8.23,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "grpcio-tools>=1.81.0",
+    "pytest>=8.0",
+]
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.27",
+    "ruff>=0.8",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: hits the live Tinkar server (skipped unless TINKAR_INTEGRATION=1)",
+    "integration_destructive: mutates server state (skipped unless TINKAR_INTEGRATION_DESTRUCTIVE=1)",
+]

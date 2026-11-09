@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Read-only Python and REST verification for the local Tinkar service"
 requires-python = ">=3.13"
 dependencies = [
+    "tinkar-python",
     "grpcio==1.81.0",
     "grpcio-health-checking==1.81.0",
     "grpcio-reflection==1.81.0",
@@ -12,4 +13,7 @@ dependencies = [
     "pydantic>=2.12.5",
     "pytest>=8.0",
 ]
+
+[tool.uv.sources]
+tinkar-python = { path = "vendor/ikm-python", editable = true }
 

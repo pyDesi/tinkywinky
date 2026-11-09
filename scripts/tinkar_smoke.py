@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Read-only REST / live-schema gRPC / unmodified ikm-python comparison.
+"""Read-only REST / live-schema gRPC / project-managed Python client comparison.
 
-Default exit: 0=all checks pass, 1=transport/data failure, 2=client mismatch.
---allow-known-client-mismatch permits only the explicitly identified old-client
-UUID and removed-service mismatches; it never suppresses transport/data failures.
+Exit 0 means all schema, identifier, stamp and transport checks pass.
+Failures are never downgraded to a successful monitoring result.
 """
 import argparse
 import json
@@ -36,7 +35,7 @@ def require(condition, message):
 
 
 class LiveSchema:
-    """Separate descriptor pool: never contaminate the client's vendored stubs."""
+    """Separate descriptor pool: independently verify the client's vendored stubs."""
 
     def __init__(self, channel):
         self.channel = channel
@@ -84,17 +83,59 @@ def rest_records(response):
     ) for r in response.get("results", []))
 
 
+def assert_client_stamps(records, http):
+    expected = {
+        tuple(sorted(r["publicId"])): r.get("stamp") for r in http["results"]
+    }
+    for record in records:
+        stamp = expected[tuple(sorted(record.public_id))]
+        require(stamp and record.stamp, "A real record stamp was lost")
+        actual = record.stamp
+        require(
+            (actual.status, actual.author, actual.module, actual.path, actual.time) ==
+            (stamp["statusPublicId"], stamp["authorPublicId"], stamp["modulePublicId"],
+             stamp["pathPublicId"], int(stamp["time"])),
+            f"Python stamp differs for {record.public_id}",
+        )
+
+
+def verify_client_schema(live):
+    from tinkar._generated import (
+        Tinkar_pb2, ike_types_pb2, ike_admin_pb2,
+        ike_graph_rag_pb2, ike_knowledge_graph_pb2,
+    )
+    from google.protobuf.descriptor_pb2 import FileDescriptorProto
+
+    def contract(file):
+        # Ignore Java/Python generator options and source locations, not the wire contract.
+        copy = FileDescriptorProto()
+        file.CopyToProto(copy)
+        copy.ClearField("options")
+        copy.ClearField("source_code_info")
+        for message in copy.message_type:
+            for field in message.field:
+                field.ClearField("json_name")
+                field.ClearField("options")
+        return copy
+
+    for module in (Tinkar_pb2, ike_types_pb2, ike_admin_pb2,
+                   ike_graph_rag_pb2, ike_knowledge_graph_pb2):
+        expected = live.pool.FindFileByName(module.DESCRIPTOR.name)
+        require(contract(module.DESCRIPTOR) == contract(expected),
+                f"Client schema differs from reflected server: {module.DESCRIPTOR.name}")
+    print("PASS vendored schemas match the active reflected wire contracts")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--grpc-port", type=int, default=9000)
     parser.add_argument("--rest-base", default="http://localhost:8099/tinkar/api")
     parser.add_argument("--client-source", type=Path,
-                        default=ROOT / ".local/upstream/ikm-python/src")
-    parser.add_argument("--allow-known-client-mismatch", action="store_true")
+                        default=ROOT / "vendor/ikm-python/src")
     args = parser.parse_args()
     # This utility is intentionally internal-only; external forwarding is out of scope.
     require(args.grpc_port in (9000, 9001), "Only internal verification ports are supported")
-    require(args.client_source.is_dir(), "Restore the pinned ikm-python checkout first")
+    require(args.client_source.is_dir(), "The project-managed Python client is missing")
     sys.path.insert(0, str(args.client_source))
     from tinkar import TinkarClient, TinkarError
 
@@ -105,11 +146,11 @@ def main():
         require(data.get("success"), f"REST {path}: {data}")
         return data
 
-    mismatches = set()
     with grpc.insecure_channel(f"localhost:{args.grpc_port}") as channel, \
             TinkarClient(host="localhost", port=args.grpc_port, timeout=30) as client:
         grpc.channel_ready_future(channel).result(timeout=15)
         live = LiveSchema(channel)
+        verify_client_schema(live)
         services = list(live.db.get_services())
         print("gRPC services:", ", ".join(sorted(services)))
         fixture = None
@@ -123,11 +164,10 @@ def main():
             response = client.search.concepts(query, max_results=3)
             actual = sorted((tuple(sorted(r.public_id)), r.fully_qualified_name)
                             for r in response.results)
-            if actual != expected:
-                require(len(actual) == len(expected) and all(not ids for ids, _ in actual)
-                        and sorted(n for _, n in actual) == sorted(n for _, n in expected),
-                        f"Unrecognized client search mismatch: {actual} vs {expected}")
-                mismatches.add("Client search silently drops public IDs (uuid_bits unsupported)")
+            require(actual == expected, f"Python search IDs/names differ: {actual} vs {expected}")
+            assert_client_stamps(response.results, http)
+            require(response.created_at and response.created_at > 0,
+                    "Python search response timestamp was lost")
             print(f"PASS search {query!r}: {len(expected)} UUID/name pairs match REST")
             fixture = fixture or expected[0]
 
@@ -140,9 +180,8 @@ def main():
         require(grpc_records(remote) == rest_records(http), "Entity UUID/name differs")
         concept = client.entities.get(concept_id).concept
         require(concept.fully_qualified_name == name, "Python entity name differs")
-        if concept.public_id != list(fixture[0]):
-            require(not concept.public_id, "Unexpected Python entity public IDs")
-            mismatches.add("Client entity response silently drops public IDs")
+        require(concept.public_id == list(fixture[0]), "Python entity public IDs differ")
+        assert_client_stamps([concept], http)
         print("PASS entity: current-schema gRPC and REST agree; Python name agrees")
         # Public GUDID parent of the device fixture: exercises non-empty navigation
         # rather than accepting only the empty children of a leaf.
@@ -157,6 +196,14 @@ def main():
                 http = rest(f"ike/{prefix}/{endpoint}", conceptId=parent_id)
                 require(grpc_records(remote) and grpc_records(remote) == rest_records(http),
                         f"Hierarchy differs or is empty: {tier}/{rpc}")
+                namespace = client.entities if tier == "IkeGraphRAG" else client.knowledge_graph
+                result = getattr(namespace, endpoint)(parent_id)
+                require(
+                    sorted((tuple(sorted(r.public_id)), r.fully_qualified_name)
+                           for r in result.concepts) == rest_records(http),
+                    f"Python hierarchy differs: {tier}/{rpc}",
+                )
+                assert_client_stamps(result.concepts, http)
                 print(f"PASS {tier}/{rpc}: {len(grpc_records(remote))} matching records")
 
         remote = live.call("IkeKnowledgeGraph/InspectConcept", payload)
@@ -173,33 +220,51 @@ def main():
         require(grpc_sem and grpc_sem == rest_sem, "Semantic IDs/patterns differ or are empty")
         semantics = client.knowledge_graph.semantics(concept_id)
         require(semantics.total_count == len(rest_sem), "Python semantics count differs")
-        if not semantics.concept_public_id:
-            require(all(not s.semantic_public_id for s in semantics.semantics),
-                    "Unrecognized partial Python semantic ID mismatch")
-            mismatches.add("Client semantics silently drops concept/semantic public IDs")
-        else:
-            require(semantics.concept_public_id == [concept_id] and
-                    sorted(tuple(sorted(s.semantic_public_id)) for s in semantics.semantics)
-                    == sorted(record[0] for record in rest_sem),
-                    "Unexpected Python semantic public IDs")
+        require(semantics.concept_public_id == [concept_id] and
+                sorted(tuple(sorted(s.semantic_public_id)) for s in semantics.semantics)
+                == sorted(record[0] for record in rest_sem),
+                "Python semantic public IDs differ")
+        reflected = {tuple(public_ids(s["semantic_public_id"])): s
+                     for s in remote["semantics"]}
+        for semantic in semantics.semantics:
+            item = reflected[tuple(sorted(semantic.semantic_public_id))]
+            require(semantic.pattern_public_id ==
+                    (public_ids(item.get("pattern_public_id", {})) or None),
+                    "Python semantic pattern ID differs")
+            require(
+                [(f.name, f.value) for f in semantic.named_fields] ==
+                [(f.get("name", ""), f.get("value", ""))
+                 for f in item.get("named_fields", [])],
+                "Python named semantic fields differ",
+            )
+            require(semantic.stamp and semantic.stamp.time ==
+                    int(item.get("stamp", {}).get("time", 0)),
+                    "Python semantic stamp was lost")
         print(f"PASS semantics: {len(rest_sem)} UUID/pattern/field/stamp records match REST")
         for operation in ("inspect_concept", "get_entity_by_public_id",
                           "load_concept_entity_graph"):
             try:
-                getattr(client.tinkar, operation)(concept_id)
+                result = getattr(client.tinkar, operation)(concept_id)
             except TinkarError as error:
-                require("Method not found" in str(error),
-                        f"Unexpected legacy error: {error}")
-                mismatches.add("Legacy client.tinkar RPCs return UNIMPLEMENTED (service removed)")
+                raise RuntimeError(f"Legacy adapter {operation} failed: {error}") from error
             else:
-                require(SERVICE + "TinkarSearchService" in services,
-                        "Legacy RPC succeeded but service not reflected")
-    for mismatch in sorted(mismatches):
-        print("CLIENT MISMATCH:", mismatch)
+                if operation == "inspect_concept":
+                    require(result.concept_public_id == [concept_id] and
+                            sorted(tuple(sorted(s.semantic_public_id)) for s in result.semantics)
+                            == sorted(record[0] for record in rest_sem),
+                            "Legacy inspection adapter lost semantic IDs")
+                else:
+                    from tinkar._generated.Tinkar_pb2 import TinkarMsg
+                    entity_ids = []
+                    for raw in result.entities:
+                        message = json_format.MessageToDict(
+                            TinkarMsg.FromString(raw), preserving_proto_field_name=True)
+                        for chronology in message.values():
+                            if isinstance(chronology, dict) and "public_id" in chronology:
+                                entity_ids.extend(public_ids(chronology["public_id"]))
+                    require(concept_id in entity_ids, f"{operation} lost the concept ID")
+                print(f"PASS legacy adapter {operation}: current service, real IDs")
     print("Read-only transport/data parity: PASS")
-    if mismatches:
-        print("Python client compatibility: FAIL; no client stubs were patched")
-        return 0 if args.allow_known_client_mismatch else 2
     print("Python client compatibility: PASS")
     return 0
 

@@ -1,8 +1,41 @@
 # REST and Python verification
 
 Verified 2026-11-09 against the public GUDID subset, not production.
-This verifies and reports upstream behavior; it does not repair upstream protocols
-or add missing DeX features.
+The original upstream baselines are retained below. The default checker now uses
+a project-managed compatible client; it does not add missing server DeX features.
+
+## Project-managed Python compatibility repair
+
+The client is now committed under `vendor/ikm-python`, installed from the root
+lockfile, and selected by the default smoke command. See
+`vendor/ikm-python/PROVENANCE.md` for the coordinated schemas and local changes.
+
+- Refreshed schemas/stubs match the active reflected server contracts.
+- UUID bit pairs, multiple UUIDs and all search/entity/navigation STAMP IDs survive
+  response conversion. Empty required, malformed and unresolved sequence IDs fail
+  explicitly instead of looking like successful empty records.
+- Coordinate override and saved-setting UUIDs use the current PublicId fields.
+  Saved-coordinate response IDs, list entries and saved-coordinate references
+  also use PublicId messages. The legacy singular `.id` keeps the first UUID;
+  `.public_id` preserves every UUID. Serialization was tested with mocks only,
+  not saves against the current store.
+- `client.tinkar.*` routes to IkeGraphRAG or IkeKnowledgeGraph. Inspection and both
+  raw chronology operations return real identifiers through the default live check.
+- Grouped/semantic result IDs, matching semantic IDs, response timestamps and
+  named semantic fields are preserved. Removed store-local nids are unavailable,
+  not fabricated.
+- The server omits pattern IDs from semantic responses; the client explicitly
+  returns `pattern_public_id=None` in that case. Pattern names are not used to
+  guess identifiers.
+- Generated stubs require grpcio 1.81.0; the declared client minimum now matches.
+- Obsolete unary admin import/export/reasoner wrappers fail before sending because
+  the current server uses streaming jobs. Typed streaming support is separate work.
+
+`bash scripts/check-tinkar.sh` now exits **0**, without an allow-mismatch flag.
+The read-only smoke compares actual IDs, stamps and semantic fields with REST and
+server reflection. It never downgrades a protocol failure to monitoring success.
+All live checks for this repair were read-only; settings serialization and index/
+admin routing were tested only with mocks, not writes against the current store.
 
 ## Results
 
@@ -10,9 +43,11 @@ or add missing DeX features.
 | --- | --- |
 | Upstream Java `./mvnw … test` | **322 passed**, 0 failures/errors/skips |
 | Unmodified Python client mock tests | **60 passed**, 35 integration tests deselected |
-| Smoke helper unit tests | **11 passed** |
+| Smoke helper unit tests (initial baseline) | **11 passed** |
+| Project smoke/client regression tests | **46 passed** |
 | Current-store read-only REST vs live-schema gRPC | **Passed** |
-| Unmodified Python client compatibility | **Failed**; silent UUID loss and removed RPC service |
+| Unmodified Python client compatibility (historical baseline) | **Failed**; silent UUID loss and removed RPC service |
+| Project-managed Python compatibility | **Passed**; strict default smoke exits 0 |
 | Upstream DeX REST scenarios, disposable dataset | **151 pass, 14 fail, 7 skip** |
 | Upstream gRPC scenarios, disposable dataset | **90 pass, 33 fail, 5 skip** |
 | Python integration suite, disposable dataset | **6 pass, 21 fail, 3 skip, 5 deselected** |
@@ -37,7 +72,9 @@ three results each for `device`, `albumin`, and `catheter`. It also compares:
   semantics. Selection is dynamic; parity is between transports on the same store,
   not between independent Lucene indexes.
 
-## Explicit compatibility problems
+## Original upstream compatibility problems
+
+These describe the unmodified reference client, not the project-managed default.
 
 1. **Public IDs silently disappear in Python.** Current `Tinkar.proto` writes
    `PublicId.uuid_bits` (field 2), two unsigned 64-bit halves per UUID. The client
@@ -117,24 +154,18 @@ restricted Nexus credentials, external gRPC forwarding or publishing was used.
 
 ## Repeat the checks
 
-Prerequisites: the active service setup in [TINKAR-SETUP.md](TINKAR-SETUP.md),
-Python 3.13, and the exact upstream client checkout:
+Prerequisites: the active service setup in [TINKAR-SETUP.md](TINKAR-SETUP.md)
+and Python 3.13. The default check does **not** require an ignored Python checkout:
 
 ```bash
-git clone https://github.com/icaglobal/ikm-python.git .local/upstream/ikm-python
-git -C .local/upstream/ikm-python checkout c7e3170db2efe3f8928c4db0ce409d393eae787c
 UV_PROJECT_ENVIRONMENT=.pythonlibs uv sync --locked
 bash scripts/check-tinkar.sh
 ```
 
-If the client already exists, verify its revision rather than cloning over it.
-Smoke exits: **0** fully compatible; **1** transport/data/unrecognized failure;
-**2** detected known Python client mismatch. Today exit **2 is expected**.
-For transport-only monitoring while explicitly retaining the mismatch warnings:
-
-```bash
-bash scripts/check-tinkar.sh --allow-known-client-mismatch
-```
+Smoke exits **0** only when fully compatible; failures return nonzero.
+The old `--allow-known-client-mismatch` escape hatch has been removed.
+This repair does not change the separate server-side missing-registry-pattern
+problem in coordinate saves or the missing DeX fixture/device scenarios.
 
 The smoke checker pins internal gRPC to 9000 (current) or 9001 (disposable).
 REST defaults to `http://localhost:8099/tinkar/api`. It does not expose any ports.
@@ -143,10 +174,13 @@ Unit tests, without a running service:
 
 ```bash
 .pythonlibs/bin/python -m pytest scripts/tests -q
-PYTHONPATH="$PWD/.local/upstream/ikm-python/src" \
-  .pythonlibs/bin/python -m pytest .local/upstream/ikm-python/tests \
-  -m 'not integration and not integration_destructive' -q
 ```
+
+The pinned ignored reference checkout remains useful for reproducing the historical
+upstream baseline and scenario suites. It is not the default dependency. Its old
+mock tests target an obsolete service, so they are not a compatibility gate for
+the updated package. Project tests exercise current wire types, legacy routing,
+malformed IDs, coordinate serialization and deterministic stub regeneration.
 
 Full upstream examples must use the disposable runner, **not pytest's incomplete
 destructive marker as a safety boundary**:

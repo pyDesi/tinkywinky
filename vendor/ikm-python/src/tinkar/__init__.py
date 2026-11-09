@@ -1,0 +1,78 @@
+"""Tinkar Python client — a gRPC client for the Tinkar terminology service."""
+
+from .client import TinkarClient
+from .exceptions import TinkarError
+from .models import (
+    AllowedStates,
+    Concept,
+    ConceptListResponse,
+    ConceptResponse,
+    ConceptSemanticInfo,
+    ConceptSemanticsResponse,
+    CoordinateListResponse,
+    CoordinateOverride,
+    EntityCountSummary,
+    ExportEntitiesResponse,
+    ExportType,
+    FieldValue,
+    GroupedResult,
+    GroupedSearchResponse,
+    ImportChangesetResponse,
+    LanguageCoordinateEntry,
+    LanguagePreset,
+    MatchingSemantic,
+    NavigationCoordinateEntry,
+    PremiseType,
+    ReasonerResults,
+    RebuildIndexResponse,
+    RunReasonerResponse,
+    SavedCoordinateResponse,
+    SearchResponse,
+    SemanticResult,
+    SemanticSearchResponse,
+    StampCoordinateEntry,
+    Stamp,
+    TinkarConceptEntityResponse,
+    TinkarResponse,
+)
+
+__all__ = [
+    "TinkarClient",
+    "TinkarError",
+    # Base
+    "TinkarResponse",
+    # Tier 1
+    "Concept",
+    "ConceptListResponse",
+    "ConceptResponse",
+    "GroupedResult",
+    "GroupedSearchResponse",
+    "MatchingSemantic",
+    "RebuildIndexResponse",
+    "SearchResponse",
+    "SemanticResult",
+    "SemanticSearchResponse",
+    # Tier 2
+    "AllowedStates",
+    "ConceptSemanticInfo",
+    "ConceptSemanticsResponse",
+    "CoordinateListResponse",
+    "CoordinateOverride",
+    "FieldValue",
+    "LanguageCoordinateEntry",
+    "LanguagePreset",
+    "NavigationCoordinateEntry",
+    "PremiseType",
+    "SavedCoordinateResponse",
+    "StampCoordinateEntry",
+    "Stamp",
+    # Tier 3
+    "EntityCountSummary",
+    "ExportEntitiesResponse",
+    "ExportType",
+    "ImportChangesetResponse",
+    "ReasonerResults",
+    "RunReasonerResponse",
+    # TinkarSearchService entity-graph RPCs
+    "TinkarConceptEntityResponse",
+]

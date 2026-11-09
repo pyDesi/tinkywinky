@@ -1,0 +1,424 @@
+syntax = "proto3";
+
+package dev.ikm.tinkar.service;
+
+import "Tinkar.proto";
+import "ike_types.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.ikm.tinkar.service.proto";
+option java_outer_classname = "IkeKnowledgeGraphProto";
+
+/*
+ * Tier 2: Concept-Aware (Knowledge Graph)
+ *
+ * Exposes the concept-oriented structure with optional coordinate overrides.
+ * Responses include PublicIds and pre-resolved labels (dual-return pattern).
+ * Target audience: analytics engineers, knowledge graph practitioners.
+ */
+
+// Allowed status states for STAMP filtering
+enum AllowedStates {
+  ACTIVE_AND_INACTIVE = 0;  // Include both active and inactive (default)
+  ACTIVE = 1;               // Only include active entities
+  INACTIVE = 2;             // Only include inactive entities
+}
+
+// Navigation premise type
+enum ProtoPremiseType {
+  INFERRED = 0;  // Use inferred (classified) navigation relationships (default)
+  STATED = 1;    // Use stated (authored) navigation relationships
+}
+
+// Optional coordinate overrides for Tier 2 queries.
+// All fields are optional — unset fields use server defaults.
+message CoordinateOverride {
+  /*
+   * Fields 3, 4, 5 and 7 were position_path_id, module_ids, excluded_module_ids and module_priority_ids: UUIDs as text (changeset format version 1). They are public ids now,
+   * under new numbers; the old numbers are reserved so that a client built
+   * before the change cannot misread a public id as text (IKE-Network/ike-issues#1235).
+   */
+  reserved 3, 4, 5, 7;
+  /*
+   * Filter by entity status. Default: ACTIVE_AND_INACTIVE.
+   */
+  AllowedStates allowed_states = 1;
+
+  /*
+   * Position time as epoch milliseconds. 0 means latest (default).
+   */
+  int64 position_time = 2;
+
+  /*
+   * Public id of the path concept (e.g., development path, master path).
+   * Absent means use default (development path).
+   */
+  dev.ikm.tinkar.schema.PublicId position_path_id = 9;
+
+  /*
+   * Public ids of module concepts to include. Empty means no module filter (allow all).
+   */
+  repeated dev.ikm.tinkar.schema.PublicId module_ids = 10;
+
+  /*
+   * Public ids of module concepts to exclude. Empty means no exclusions.
+   */
+  repeated dev.ikm.tinkar.schema.PublicId excluded_module_ids = 11;
+
+  /*
+   * Navigation premise type. Default: INFERRED.
+   */
+  ProtoPremiseType premise_type = 6;
+
+  /*
+   * Ordered list of module concept public ids for priority when multiple versions compete.
+   * Order matters — earlier entries take precedence. Empty means server default.
+   */
+  repeated dev.ikm.tinkar.schema.PublicId module_priority_ids = 12;
+
+  /*
+   * Language coordinate preset controlling description type and dialect preference.
+   * Default (US_ENGLISH_REGULAR_NAME = 0) means use server default.
+   */
+  ProtoLanguagePreset language_preset = 8;
+}
+
+// Request message with coordinate support for concept-level queries
+message KnowledgeGraphConceptRequest {
+  /*
+   * The public ID of the concept (supports multiple UUIDs).
+   */
+  dev.ikm.tinkar.schema.PublicId public_id = 1;
+
+  /*
+   * Optional coordinate overrides. If not set, server defaults are used.
+   */
+  CoordinateOverride coordinate_override = 2;
+}
+
+// Settings for a saved StampCoordinate. Unset fields use server defaults.
+message StampCoordinateSettings {
+  /*
+   * Fields 3 to 6 were position_path_id, module_ids, excluded_module_ids and module_priority_ids: UUIDs as text (changeset format version 1). They are public ids now,
+   * under new numbers; the old numbers are reserved so that a client built
+   * before the change cannot misread a public id as text (IKE-Network/ike-issues#1235).
+   */
+  reserved 3, 4, 5, 6;
+  AllowedStates allowed_states = 1;
+  int64 position_time = 2;         // 0 means latest (default)
+  dev.ikm.tinkar.schema.PublicId position_path_id = 7;     // absent means development path (default)
+  repeated dev.ikm.tinkar.schema.PublicId module_ids = 8;
+  repeated dev.ikm.tinkar.schema.PublicId excluded_module_ids = 9;
+  repeated dev.ikm.tinkar.schema.PublicId module_priority_ids = 10;
+}
+
+// Settings for a saved NavigationCoordinate.
+message NavigationCoordinateSettings {
+  ProtoPremiseType premise_type = 1;  // Default: INFERRED
+}
+
+// Language preset — maps to Coordinates.Language.* factory methods
+enum ProtoLanguagePreset {
+  US_ENGLISH_REGULAR_NAME = 0;          // Coordinates.Language.UsEnglishRegularName() (default)
+  US_ENGLISH_FULLY_QUALIFIED_NAME = 1;  // Coordinates.Language.UsEnglishFullyQualifiedName()
+  GB_ENGLISH_PREFERRED_NAME = 2;        // Coordinates.Language.GbEnglishPreferredName()
+  GB_ENGLISH_FULLY_QUALIFIED_NAME = 3;  // Coordinates.Language.GbEnglishFullyQualifiedName()
+  ANY_LANGUAGE_REGULAR_NAME = 4;        // Coordinates.Language.AnyLanguageRegularName()
+  ANY_LANGUAGE_FULLY_QUALIFIED_NAME = 5; // Coordinates.Language.AnyLanguageFullyQualifiedName()
+  ANY_LANGUAGE_DEFINITION = 6;          // Coordinates.Language.AnyLanguageDefinition()
+  SPANISH_PREFERRED_NAME = 7;           // Coordinates.Language.SpanishPreferredName()
+  SPANISH_FULLY_QUALIFIED_NAME = 8;     // Coordinates.Language.SpanishFullyQualifiedName()
+}
+
+// Settings for a saved LanguageCoordinate.
+message LanguageCoordinateSettings {
+  ProtoLanguagePreset language_preset = 1;  // Default: US_ENGLISH_REGULAR_NAME
+}
+
+// Request for saving a StampCoordinate
+message SaveStampCoordinateRequest {
+  StampCoordinateSettings settings = 1;
+}
+
+// A saved StampCoordinate with its content-derived UUID
+message SavedStampCoordinateResponse {
+  /*
+   * Field 1 was id: UUIDs as text (changeset format version 1). They are public ids now,
+   * under new numbers; the old numbers are reserved so that a client built
+   * before the change cannot misread a public id as text (IKE-Network/ike-issues#1235).
+   */
+  reserved 1;
+  dev.ikm.tinkar.schema.PublicId id = 4;                      // Content-derived UUID; pass as stamp_coordinate_id elsewhere
+  StampCoordinateSettings settings = 2;
+  string created_at = 3;              // ISO-8601 timestamp
+}
+
+// Request for listing all saved StampCoordinates (no parameters)
+message ListStampCoordinatesRequest {}
+
+// All saved StampCoordinates
+message ListStampCoordinatesResponse {
+  repeated SavedStampCoordinateResponse coordinates = 1;
+  int64 created_at = 2;
+}
+
+// Request for saving a NavigationCoordinate
+message SaveNavigationCoordinateRequest {
+  NavigationCoordinateSettings settings = 1;
+}
+
+// A saved NavigationCoordinate with its content-derived UUID
+message SavedNavigationCoordinateResponse {
+  /*
+   * Field 1 was id: UUIDs as text (changeset format version 1). They are public ids now,
+   * under new numbers; the old numbers are reserved so that a client built
+   * before the change cannot misread a public id as text (IKE-Network/ike-issues#1235).
+   */
+  reserved 1;
+  dev.ikm.tinkar.schema.PublicId id = 4;                           // Content-derived UUID; pass as navigation_coordinate_id elsewhere
+  NavigationCoordinateSettings settings = 2;
+  string created_at = 3;                   // ISO-8601 timestamp
+}
+
+// Request for listing all saved NavigationCoordinates (no parameters)
+message ListNavigationCoordinatesRequest {}
+
+// All saved NavigationCoordinates
+message ListNavigationCoordinatesResponse {
+  repeated SavedNavigationCoordinateResponse coordinates = 1;
+  int64 created_at = 2;
+}
+
+// Request for saving a LanguageCoordinate
+message SaveLanguageCoordinateRequest {
+  LanguageCoordinateSettings settings = 1;
+}
+
+// A saved LanguageCoordinate with its content-derived UUID
+message SavedLanguageCoordinateResponse {
+  /*
+   * Field 1 was id: UUIDs as text (changeset format version 1). They are public ids now,
+   * under new numbers; the old numbers are reserved so that a client built
+   * before the change cannot misread a public id as text (IKE-Network/ike-issues#1235).
+   */
+  reserved 1;
+  dev.ikm.tinkar.schema.PublicId id = 4;                          // Content-derived UUID; pass as language_coordinate_id elsewhere
+  LanguageCoordinateSettings settings = 2;
+  string created_at = 3;                  // ISO-8601 timestamp
+}
+
+// Request for listing all saved LanguageCoordinates (no parameters)
+message ListLanguageCoordinatesRequest {}
+
+// All saved LanguageCoordinates
+message ListLanguageCoordinatesResponse {
+  repeated SavedLanguageCoordinateResponse coordinates = 1;
+  int64 created_at = 2;
+}
+
+// Request for getting semantics using previously saved coordinate IDs.
+// All IDs are optional — omitted values use server defaults.
+message SemanticsWithCoordinateRequest {
+  dev.ikm.tinkar.schema.PublicId concept_public_id = 1;
+  /*
+   * Fields 2 to 4 were stamp_coordinate_id, navigation_coordinate_id and language_coordinate_id: UUIDs as text (changeset format version 1). They are public ids now,
+   * under new numbers; the old numbers are reserved so that a client built
+   * before the change cannot misread a public id as text (IKE-Network/ike-issues#1235).
+   */
+  reserved 2, 3, 4;
+  dev.ikm.tinkar.schema.PublicId stamp_coordinate_id = 5;       // id returned by SaveStampCoordinate
+  dev.ikm.tinkar.schema.PublicId navigation_coordinate_id = 6;  // id returned by SaveNavigationCoordinate
+  dev.ikm.tinkar.schema.PublicId language_coordinate_id = 7;    // id returned by SaveLanguageCoordinate
+}
+
+/*
+ * Entities authored by a client, to be committed to the server's store as one
+ * transaction.
+ *
+ * Entities carry PublicIds, not NIDs: a NID is assigned per store, so the
+ * client's are meaningless here. The server resolves each PublicId against its
+ * own store, assigning new NIDs for entities it has not seen.
+ */
+message CommitEntitiesRequest {
+  /*
+   * The complete set of entities in one client-side transaction — concept,
+   * its semantics, and the stamps they reference. Order is not significant;
+   * the server resolves references after all entities are loaded.
+   */
+  repeated dev.ikm.tinkar.schema.TinkarMsg entities = 1;
+
+  /*
+   * Names the server-side transaction, for audit. The client's own transaction
+   * name, or empty to let the server pick one.
+   */
+  string transaction_name = 2;
+}
+
+// Outcome of a CommitEntities call.
+message CommitEntitiesResponse {
+  /*
+   * Whether the commit succeeded. The server decodes every entity before
+   * storing any, so a malformed request fails with the store untouched. A
+   * failure after decoding may have stored some entities — the store has no
+   * rollback — so treat false as "resend", not as "nothing happened".
+   */
+  bool success = 1;
+  // Error message if the commit failed.
+  string error_message = 2;
+  // How many entities were written.
+  int32 entities_committed = 3;
+  /*
+   * Server-assigned commit time, in Unix epoch milliseconds. The client
+   * advances its view to this to see the committed state.
+   */
+  int64 commit_time = 4;
+  // Unix epoch milliseconds when this response was generated.
+  int64 created_at = 5;
+}
+
+// Request for every pattern in the store.
+message ListPatternsRequest {}
+
+/*
+ * Every pattern in the store, with what a client needs to show and use them:
+ * the pattern chronologies, their descriptions, and the stamps of both.
+ *
+ * A client whose store is remote holds only the patterns it has happened to
+ * load, so it cannot list them itself. The list is small (tens to hundreds).
+ */
+message ListPatternsResponse {
+  bool success = 1;
+  string error_message = 2;
+  // The patterns, their description semantics, and the stamps they use.
+  repeated dev.ikm.tinkar.schema.TinkarMsg entities = 3;
+  // How many patterns the store holds.
+  int32 pattern_count = 4;
+  // Unix epoch milliseconds when this response was generated.
+  int64 created_at = 5;
+}
+
+/*
+ * One page of a pattern's members (its semantics).
+ *
+ * A pattern can have millions of members, so they are read a page at a time,
+ * in the store's own order, which is stable between calls.
+ */
+message ListPatternMembersRequest {
+  // The pattern whose members to list.
+  dev.ikm.tinkar.schema.PublicId pattern_id = 1;
+  // How many matching members to skip.
+  int32 offset = 2;
+  // How many members to return; 0 or more than the server's cap means the cap (1000).
+  int32 limit = 3;
+  /*
+   * Optional. Only members whose referenced component's preferred description
+   * contains this text, ignoring case. Matching stops once the page is full, so
+   * a filtered page does not report how many match in all.
+   */
+  string referenced_component_text = 4;
+  // Optional. Only members that refer to this component.
+  dev.ikm.tinkar.schema.PublicId referenced_component_id = 5;
+}
+
+message ListPatternMembersResponse {
+  bool success = 1;
+  string error_message = 2;
+  // How many members the pattern has in all, unfiltered.
+  int64 total_count = 3;
+  /*
+   * The page: its semantics, the stamps they use, and each referenced
+   * component with its description semantics, so a client can label every
+   * member without a call per row.
+   */
+  repeated dev.ikm.tinkar.schema.TinkarMsg entities = 4;
+  // The public ids of the page's members, in order.
+  repeated dev.ikm.tinkar.schema.PublicId member_ids = 5;
+  // Whether members beyond this page match.
+  bool has_more = 6;
+  // Unix epoch milliseconds when this response was generated.
+  int64 created_at = 7;
+}
+
+service IkeKnowledgeGraph {
+  // Get all semantics attached to a concept (patterns, fields, STAMP info) — human-readable inspection
+  rpc InspectConcept(KnowledgeGraphConceptRequest) returns (TinkarConceptSemanticsResponse);
+
+  // Get direct child concepts with coordinate-aware navigation (premise type controls STATED vs INFERRED hierarchy)
+  rpc GetChildConcepts(KnowledgeGraphConceptRequest) returns (TinkarSearchQueryResponse);
+
+  // Get all descendant concepts (full subtree) with coordinate-aware navigation
+  rpc GetDescendantConcepts(KnowledgeGraphConceptRequest) returns (TinkarSearchQueryResponse);
+
+  // Save a StampCoordinate to the dataset (idempotent — same settings return same UUID)
+  rpc SaveStampCoordinate(SaveStampCoordinateRequest) returns (SavedStampCoordinateResponse);
+
+  // List all saved StampCoordinates
+  rpc ListStampCoordinates(ListStampCoordinatesRequest) returns (ListStampCoordinatesResponse);
+
+  // Save a NavigationCoordinate to the dataset (idempotent — same settings return same UUID)
+  rpc SaveNavigationCoordinate(SaveNavigationCoordinateRequest) returns (SavedNavigationCoordinateResponse);
+
+  // List all saved NavigationCoordinates
+  rpc ListNavigationCoordinates(ListNavigationCoordinatesRequest) returns (ListNavigationCoordinatesResponse);
+
+  // Save a LanguageCoordinate to the dataset (idempotent — same settings return same UUID)
+  rpc SaveLanguageCoordinate(SaveLanguageCoordinateRequest) returns (SavedLanguageCoordinateResponse);
+
+  // List all saved LanguageCoordinates
+  rpc ListLanguageCoordinates(ListLanguageCoordinatesRequest) returns (ListLanguageCoordinatesResponse);
+
+  // Get semantics for a concept using previously saved coordinate IDs (all optional)
+  rpc GetSemanticsWithCoordinate(SemanticsWithCoordinateRequest) returns (TinkarConceptSemanticsResponse);
+  /*
+   * Returns a single entity (plus its version stamps) for the given public ID.
+   * Used as a fallback when an entity is not in the caller's local cache.
+   * Mirrors REST GET /api/ike/knowledgegraph/entity-by-id.
+   *
+   * coordinate_override is ignored: this returns the raw entity for the caller to
+   * load into its own store and resolve against its own coordinate.
+   */
+  rpc GetEntityByPublicId(KnowledgeGraphConceptRequest) returns (TinkarConceptEntityResponse);
+
+  /*
+   * Returns the full entity graph for a concept (concept + semantics + patterns +
+   * stamps) so the caller can load it into a local entity store and show the concept
+   * detail view. Mirrors REST GET /api/ike/knowledgegraph/entity-graph.
+   *
+   * coordinate_override is ignored, for the same reason as GetEntityByPublicId.
+   */
+  rpc LoadConceptEntityGraph(KnowledgeGraphConceptRequest) returns (TinkarConceptEntityResponse);
+
+  /*
+   * Returns the field values, pattern name, and STAMP info for a single semantic
+   * instance, addressed by the semantic's own public ID — as opposed to
+   * InspectConcept, which lists every semantic attached to a concept but cannot be
+   * addressed by a semantic's own ID. Mirrors REST GET /api/ike/knowledgegraph/semantics.
+   */
+  rpc GetSemanticInfo(KnowledgeGraphConceptRequest) returns (TinkarSemanticInfoResponse);
+
+  /*
+   * Commits client-authored entities to the server's store as one transaction.
+   *
+   * The write counterpart to GetEntityByPublicId / LoadConceptEntityGraph: a
+   * client whose store is remote has nowhere durable to put an edit, so it
+   * sends the entities its own transaction produced and the server commits
+   * them together.
+   *
+   * Unary rather than streaming because a transaction is a single atomic unit
+   * — there is no partial result worth reporting before it completes.
+   */
+  rpc CommitEntities(CommitEntitiesRequest) returns (CommitEntitiesResponse);
+
+  /*
+   * Lists every pattern in the store, with their descriptions. A client with a
+   * remote store cannot enumerate patterns from what it has loaded.
+   */
+  rpc ListPatterns(ListPatternsRequest) returns (ListPatternsResponse);
+
+  /*
+   * Returns one page of a pattern's members and the pattern's total member
+   * count, optionally filtered by the referenced component.
+   */
+  rpc ListPatternMembers(ListPatternMembersRequest) returns (ListPatternMembersResponse);
+
+}
