@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Tinkar Workbench"
+description = "A practical live demonstration of the three DeX device scenarios using the Tinkar REST service and repaired Python gRPC client."
+version = "1.0.0"
+id = "artifacts/tinkar-workbench"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 21394
+
+[services.development]
+run = "pnpm --filter @workspace/tinkar-workbench run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/tinkar-workbench", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/tinkar-workbench/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "21394"
+BASE_PATH = "/"

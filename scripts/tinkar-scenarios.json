@@ -1,0 +1,23 @@
+[
+  {
+    "id": 1,
+    "title": "Single-device inspection",
+    "description": "Find Roche COBAS Integra Albumin Gen.2 and retrieve its DeX semantics and LIDR records.",
+    "deviceCount": 1,
+    "devices": ["Roche COBAS Integra Albumin Gen.2"]
+  },
+  {
+    "id": 2,
+    "title": "Respiratory device comparison",
+    "description": "Retrieve four respiratory devices side by side. Compare available terminology attributes, without inventing clinical sensitivity values.",
+    "deviceCount": 4,
+    "devices": ["Panther Fusion SARS-CoV-2/Flu A/B/RSV", "ARIES Flu A/B & RSV Assay", "Simplexa COVID-19 & Flu A/B Direct", "GeneXpert Xpert Xpress CoV-2/Flu/RSV"]
+  },
+  {
+    "id": 3,
+    "title": "Twelve-device attribute review",
+    "description": "Retrieve the twelve upstream DeX fixtures, inspect identifiers and semantic fields, and export the available data.",
+    "deviceCount": 12,
+    "devices": ["Roche COBAS Integra Albumin Gen.2", "Panther Fusion SARS-CoV-2/Flu A/B/RSV", "ARIES Flu A/B & RSV Assay", "Simplexa COVID-19 & Flu A/B Direct", "GeneXpert Xpert Xpress CoV-2/Flu/RSV", "Atellica IM High-Sensitivity Troponin I", "i-STAT hs-TnI Cartridge", "Architect Hemoglobin A1c", "VITROS Chemistry HbA1c", "HER2 IQFISH pharmDx Kit", "Abbott RealTime IDH1", "UniCel DxH hematology systems"]
+  }
+]

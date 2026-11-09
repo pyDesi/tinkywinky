@@ -24,8 +24,121 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /workbench/status:
+    get:
+      operationId: getWorkbenchStatus
+      responses:
+        "200":
+          description: Live service availability
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkbenchStatus"
+  /workbench/scenarios:
+    get:
+      operationId: listScenarios
+      responses:
+        "200":
+          description: The three upstream DeX cases
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Scenario"
+  /workbench/scenarios/{id}/run:
+    post:
+      operationId: runScenario
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 3
+      responses:
+        "200":
+          description: Read-only live scenario results, including partial failures
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScenarioResult"
+        "503":
+          description: Client or service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkbenchError"
 components:
   schemas:
+    WorkbenchError:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+    WorkbenchStatus:
+      type: object
+      required: [online, dataset, checkedAt, message]
+      properties:
+        online: { type: boolean }
+        dataset: { type: string }
+        checkedAt: { type: string }
+        message: { type: string }
+    Scenario:
+      type: object
+      required: [id, title, description, deviceCount, devices]
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        description: { type: string }
+        deviceCount: { type: integer }
+        devices:
+          type: array
+          items: { type: string }
+    DeviceResult:
+      type: object
+      required: [label, query, status, message, publicIds, name, semanticCount, semanticJson, searchJson, restJson, parity, patterns, stampCount, lidrCount, lidrMessage]
+      properties:
+        label: { type: string }
+        query: { type: string }
+        status: { type: string, enum: [found, missing, error] }
+        message: { type: string }
+        publicIds:
+          type: array
+          items: { type: string }
+        name: { type: string }
+        semanticCount: { type: integer }
+        stampCount: { type: integer }
+        lidrCount: { type: integer }
+        lidrMessage: { type: string }
+        semanticJson: { type: string }
+        searchJson: { type: string }
+        restJson: { type: string }
+        parity: { type: string, enum: [match, mismatch, unavailable, not_checked] }
+        patterns:
+          type: array
+          items: { type: string }
+    ScenarioResult:
+      type: object
+      required: [scenarioId, executedAt, durationMs, found, missing, errors, devices, logs, limitations]
+      properties:
+        scenarioId: { type: integer }
+        executedAt: { type: string }
+        durationMs: { type: integer }
+        found: { type: integer }
+        missing: { type: integer }
+        errors: { type: integer }
+        devices:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeviceResult"
+        logs:
+          type: array
+          items: { type: string }
+        limitations:
+          type: array
+          items: { type: string }
     HealthStatus:
       type: object
       properties:
