@@ -5,6 +5,6 @@ description: Avoid mixing current Tinkar source with incompatible published snap
 
 Treat Tinkar service, schema, and core dependencies as a coordinated revision set rather than independently selecting the latest source and public Nexus snapshots.
 
-**Why:** A fresh Replit setup encountered service API definitions and core methods newer than their published snapshots. Building the matching schema source resolved the first mismatch, but rebuilding core exposed further build dependencies.
+**Why:** Source and public snapshots have fallen out of alignment in both directions: service source initially expected unpublished APIs, while a later retry of the old checkout resolved a newer BOM with renamed modules. Locally installed source-built snapshots can also mask newer remote artifacts despite identical version strings.
 
-**How to apply:** Recheck alignment on future attempts, since publication can catch up. Prefer a known-good service revision with matching dependency versions or a complete coordinated upstream source build. Do not remove operations or fabricate protobuf definitions merely to make the server start. Local dependency overlays are experiments until the whole service is verified.
+**How to apply:** Recheck current source and snapshot metadata rather than assuming an earlier build blocker persists. Use an isolated Maven repository for source-build experiments so local SNAPSHOT overrides do not contaminate a clean public-dependency build. Prefer a known-good service revision with matching dependency versions or a complete coordinated upstream source build. Do not remove operations or fabricate protobuf definitions merely to make the server start. Local dependency overlays are experiments until the whole service is verified.
