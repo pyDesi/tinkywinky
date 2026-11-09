@@ -63,8 +63,10 @@ if the JDK or service JAR is missing.
 - The internal gRPC health check returned `SERVING`.
 - Swagger rendered correctly in the preview.
 
-The full upstream test suite and Patrick's Python client/DeX examples have not
-been run. Tests were skipped for the initial build and startup check.
+The upstream Java suite and Patrick's Python/DeX examples have now been run.
+See [TINKAR-VERIFICATION.md](TINKAR-VERIFICATION.md) for the results, explicit
+protocol mismatches, safety incident, and repeatable read-only/disposable checks.
+The Java suite passes; the Python client is not fully compatible with this server.
 
 ## Development-only limitations
 
