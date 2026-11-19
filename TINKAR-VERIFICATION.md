@@ -4,6 +4,76 @@ Verified 2026-11-09 against the public GUDID subset, not production.
 The original upstream baselines are retained below. The default checker now uses
 a project-managed compatible client; it does not add missing server DeX features.
 
+## Coordinate safety fixes
+
+The unmodified-upstream results below are historical. Reviewable coordinate
+service and Python-example fixes now live in
+[`patches/tinkar-coordinates/`](patches/tinkar-coordinates/README.md), against the
+same pinned upstream revisions. They were built in separate checkouts; the active
+service JAR, workflow and current store were not changed or used for write checks.
+
+The public GUDID archive does not contain the required coordinate registry
+patterns. The patched service deliberately returns an explicit dataset-capability
+error: REST **412** with `COORDINATE_REGISTRY_UNAVAILABLE`, or gRPC
+**FAILED_PRECONDITION** with the same code. It does not create concept stubs,
+invent an authoritative registry ontology, or allocate a transaction before
+refusing an unsupported save/list/lookup.
+
+All four live Python coordinate-save tests are now marked
+`integration_destructive`. Collection with `not integration_destructive` selects
+**26 of 35** integration tests (9 deselected), rather than accidentally selecting
+coordinate writes. The collection audit rejects unmarked saves; the unchanged
+positive RPC allowlist in `scripts/tinkar_smoke.py` remains the actual current-store
+safety boundary. Neither pytest markers nor the audit authorize running upstream
+tests on the current store.
+
+### Fresh public-store checks
+
+`bash scripts/check-tinkar-coordinates.sh` extracts two new copies of the
+checksum-pinned public archive. It never copies the current store, uses only
+loopback ports 8100/9001, and stops its own server on exit.
+
+- The first copy verifies nine missing-capability refusals (save/list/lookup for
+  all three coordinate types). Entity counts, store write sequence, and registry
+  UUID presence are unchanged; no transaction factory is called.
+- The Java test then **explicitly provisions test-only patterns in that disposable
+  copy**. Stamp, navigation and language save/list/lookup and repeated-save
+  idempotency pass, including unchanged creation timestamps and no extra write
+  sequence on a duplicate save. This does not mean the unmodified public archive
+  supports saving coordinates.
+- An injected failure after stamp allocation confirms no new coordinate becomes
+  visible. **One allocated entity remained** after cancellation in the verified
+  run: cancellation is not a promise of physical rollback.
+- The second extraction has no test-only schema provisioning. It checks real
+  REST/gRPC capability responses and coordinate filtering against a device
+  discovered from that dataset, comparing exact semantic IDs rather than counts.
+- Python examples use verified fixture overrides for the public hierarchy and
+  skip unsupported saves only for the explicit capability reason. Missing
+  optional SNOMED fixtures skip with their UUID and a fixture-override hint.
+  Other errors, including UNKNOWN/500 and transport failures, remain failures.
+
+Local safety helper tests: **17 passed**. Unchanged Python mock tests:
+**60 passed, 35 deselected**. Focused Java capability and controller tests:
+**49 passed**. The opt-in public-store Java check also passed.
+The Python client's separate UUID-decoding/removed-service problems described
+below are not repaired or suppressed by these coordinate patches.
+
+The final disposable transport run exited **0**:
+
+- **10** ACTIVE semantic IDs, **0** INACTIVE IDs, and **0** prehistory IDs agreed
+  between REST and reflected current-schema gRPC.
+- A module UUID read from the fixture's actual stamp split the same baseline
+  into disjoint **8 included + 2 excluded** semantic IDs on both transports.
+- Python public hierarchy examples: **2 passed, 4 capability skips, 1 deselected**.
+- Original optional terminology fixtures: **3 explicit skips, 4 deselected**.
+- The OpenAPI document returned HTTP 200 with the controller-local error handler.
+
+Reproduction commands, patch application instructions, and the difference between
+unprovisioned public data and test-only registry fixtures are documented in the
+patch directory. Detailed evidence stays under ignored
+`generated-artifacts/tinkar-coordinate-checks/`: `java-final.log`,
+`run-NRaCfm/public-store.log`, and `run-1P1tk4/` (transport/example/collection logs).
+
 ## Project-managed Python compatibility repair
 
 The client is now committed under `vendor/ikm-python`, installed from the root

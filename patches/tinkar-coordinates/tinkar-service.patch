@@ -1,0 +1,530 @@
+diff --git a/src/main/java/dev/ikm/tinkar/service/controller/knowledgegraph/CoordinateCapabilityAdvice.java b/src/main/java/dev/ikm/tinkar/service/controller/knowledgegraph/CoordinateCapabilityAdvice.java
+new file mode 100644
+index 0000000..7196675
+--- /dev/null
++++ b/src/main/java/dev/ikm/tinkar/service/controller/knowledgegraph/CoordinateCapabilityAdvice.java
+@@ -0,0 +1,24 @@
++package dev.ikm.tinkar.service.controller.knowledgegraph;
++
++import dev.ikm.tinkar.service.service.CoordinateCapabilityException;
++import io.grpc.Status;
++import net.devh.boot.grpc.server.advice.GrpcAdvice;
++import net.devh.boot.grpc.server.advice.GrpcExceptionHandler;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.ResponseEntity;
++
++import java.util.Map;
++
++/** Keep unsupported dataset errors explicit on both transports. */
++@GrpcAdvice
++public class CoordinateCapabilityAdvice {
++    public static ResponseEntity<Map<String, String>> rest(CoordinateCapabilityException error) {
++        return ResponseEntity.status(HttpStatus.PRECONDITION_FAILED).body(
++                Map.of("code", CoordinateCapabilityException.CODE, "message", error.getMessage()));
++    }
++
++    @GrpcExceptionHandler(CoordinateCapabilityException.class)
++    public Status grpc(CoordinateCapabilityException error) {
++        return Status.FAILED_PRECONDITION.withDescription(error.getMessage());
++    }
++}
+diff --git a/src/main/java/dev/ikm/tinkar/service/controller/knowledgegraph/KnowledgeGraphRestController.java b/src/main/java/dev/ikm/tinkar/service/controller/knowledgegraph/KnowledgeGraphRestController.java
+index afd6ffd..457b692 100644
+--- a/src/main/java/dev/ikm/tinkar/service/controller/knowledgegraph/KnowledgeGraphRestController.java
++++ b/src/main/java/dev/ikm/tinkar/service/controller/knowledgegraph/KnowledgeGraphRestController.java
+@@ -12,6 +12,7 @@ import dev.ikm.tinkar.service.dto.SavedNavigationCoordinateResponse;
+ import dev.ikm.tinkar.service.dto.TinkarSearchQueryResponse;
+ import dev.ikm.tinkar.service.service.CoordinateFactory;
+ import dev.ikm.tinkar.service.service.CoordinateStoreService;
++import dev.ikm.tinkar.service.service.CoordinateCapabilityException;
+ import dev.ikm.tinkar.service.service.TinkarService;
+ import dev.ikm.tinkar.service.util.ProtoConversionUtils;
+ import dev.ikm.tinkar.coordinate.view.calculator.ViewCalculatorWithCache;
+@@ -52,6 +53,12 @@ import java.util.List;
+ @Tag(name = "IKE Knowledge Graph (Tier 2)", description = "Concept-aware API exposing STAMP coordinates, semantic patterns, and version history.")
+ public class KnowledgeGraphRestController {
+ 
++    // Controller-local handling also avoids global-advice inspection in older springdoc.
++    @org.springframework.web.bind.annotation.ExceptionHandler(CoordinateCapabilityException.class)
++    public ResponseEntity<java.util.Map<String, String>> coordinateCapability(CoordinateCapabilityException error) {
++        return CoordinateCapabilityAdvice.rest(error);
++    }
++
+     private final TinkarService tinkarService;
+     private final CoordinateStoreService coordinateStoreService;
+ 
+diff --git a/src/main/java/dev/ikm/tinkar/service/service/CoordinateCapabilityException.java b/src/main/java/dev/ikm/tinkar/service/service/CoordinateCapabilityException.java
+new file mode 100644
+index 0000000..7f6fa46
+--- /dev/null
++++ b/src/main/java/dev/ikm/tinkar/service/service/CoordinateCapabilityException.java
+@@ -0,0 +1,14 @@
++package dev.ikm.tinkar.service.service;
++
++import java.util.UUID;
++
++/** Dataset schema is insufficient for saved coordinates; no write was attempted. */
++public class CoordinateCapabilityException extends RuntimeException {
++    public static final String CODE = "COORDINATE_REGISTRY_UNAVAILABLE";
++
++    public CoordinateCapabilityException(String type, UUID registryUuid) {
++        super(CODE + ": dataset does not support saved " + type
++                + " coordinates; requires registry pattern " + registryUuid
++                + " with two string fields (coordinate ID, settings JSON). No write attempted.");
++    }
++}
+diff --git a/src/main/java/dev/ikm/tinkar/service/service/CoordinateStoreService.java b/src/main/java/dev/ikm/tinkar/service/service/CoordinateStoreService.java
+index 493d60f..0c260a2 100644
+--- a/src/main/java/dev/ikm/tinkar/service/service/CoordinateStoreService.java
++++ b/src/main/java/dev/ikm/tinkar/service/service/CoordinateStoreService.java
+@@ -8,12 +8,12 @@ import dev.ikm.tinkar.service.dto.SavedStampCoordinateResponse;
+ import dev.ikm.tinkar.service.dto.StampCoordinateDto;
+ import dev.ikm.tinkar.terms.KernelConcept;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+-import dev.ikm.tinkar.common.id.PublicId;
+ import dev.ikm.tinkar.common.id.PublicIds;
+ import dev.ikm.tinkar.coordinate.language.LanguageCoordinateRecord;
+ import dev.ikm.tinkar.coordinate.navigation.NavigationCoordinateRecord;
+ import dev.ikm.tinkar.coordinate.stamp.StampCoordinateRecord;
+-import dev.ikm.tinkar.entity.ConceptRecord;
++import dev.ikm.tinkar.entity.EntityHandle;
++import dev.ikm.tinkar.entity.PatternEntity;
+ import dev.ikm.tinkar.entity.EntityService;
+ import dev.ikm.tinkar.entity.SemanticEntity;
+ import dev.ikm.tinkar.entity.SemanticEntityVersion;
+@@ -35,20 +35,14 @@ import java.util.UUID;
+ /**
+  * Manages saved coordinate configurations as first-class Tinkar entities in the loaded dataset.
+  *
+- * <p>Each saved coordinate consists of two entities written in one transaction:
+- * <ol>
+- *   <li>A {@code ConceptRecord} whose UUID is derived deterministically from the coordinate's
+- *       content — identical settings always produce the same UUID (idempotent saves).</li>
+- *   <li>A {@code SemanticRecord} attached to that concept using a <em>type-specific</em> pattern
+- *       ({@link #STAMP_COORDINATE_PATTERN_UUID}, {@link #NAVIGATION_COORDINATE_PATTERN_UUID}, or
+- *       {@link #LANGUAGE_COORDINATE_PATTERN_UUID}), with a single field: JSON-serialized coordinate
+- *       settings.</li>
+- * </ol>
++ * <p>Each save writes a semantic with two string fields (content-derived coordinate UUID,
++ * JSON settings). The registry must already be a two-string-field pattern, also used as
++ * the referenced component. This service does not invent dataset schema on first use.
+  *
+  * <p>Coordinates are stored in RocksDB and survive server restarts.
+  * Listing uses {@code EntityService.get().forEachSemanticForComponent(registryNid, ...)}
+  * (and lookup by id {@code semanticsForComponent(registryNid)}), keyed by the registry
+- * concept's full 64-bit {@code rocksKeyForNid} — immune to the nid element-sequence
++ * pattern's full 64-bit {@code rocksKeyForNid} — immune to the nid element-sequence
+  * collision that breaks {@code semanticsOfPattern}.
+  */
+ @Component
+@@ -56,9 +50,9 @@ public class CoordinateStoreService {
+     private static final Logger log = LoggerFactory.getLogger(CoordinateStoreService.class);
+ 
+     /**
+-     * Registry concept UUIDs — one per coordinate type.
++     * Registry pattern UUIDs — one per coordinate type.
+      *
+-     * <p>All saved coordinate semantics use the registry concept as their
++     * <p>All saved coordinate semantics use the registry pattern as their
+      * {@code referencedComponentNid}.  Listing uses
+      * {@code EntityService.get().semanticsForComponent(registryNid)}, which is indexed
+      * by the full 64-bit {@code rocksKeyForNid(componentNid)} and therefore immune to
+@@ -75,10 +69,6 @@ public class CoordinateStoreService {
+ 
+     private final ObjectMapper objectMapper = new ObjectMapper();
+ 
+-    private volatile long stampRegistryNid = -1;
+-    private volatile long navigationRegistryNid = -1;
+-    private volatile long languageRegistryNid = -1;
+-
+     // ────────────────────────────────────────────────────────────────────────
+     // Stamp coordinate
+ 
+@@ -87,9 +77,9 @@ public class CoordinateStoreService {
+      * the existing record is returned unchanged (idempotent).
+      */
+     public SavedStampCoordinateResponse saveStamp(StampCoordinateDto dto) {
++        long registryNid = stampRegistryNid();
+         StampCoordinateRecord record = CoordinateFactory.buildStampCoordinate(dto);
+         UUID coordinateUuid = record.getStampFilterUuid();
+-        long registryNid = stampRegistryNid();
+ 
+         Optional<SavedStampCoordinateResponse> existing = findStampById(coordinateUuid.toString());
+         if (existing.isPresent()) {
+@@ -136,15 +126,17 @@ public class CoordinateStoreService {
+ 
+     /** List all saved StampCoordinates in the dataset. */
+     public List<SavedStampCoordinateResponse> findAllStamp() {
++        long registryNid = stampRegistryNid();
+         List<SavedStampCoordinateResponse> results = new ArrayList<>();
+-        EntityService.get().forEachSemanticForComponent(stampRegistryNid(),
++        EntityService.get().forEachSemanticForComponent(registryNid,
+                 semantic -> deserializeStampSemantic(semantic).ifPresent(results::add));
+         return results;
+     }
+ 
+     /** Look up a saved StampCoordinate by its content-derived UUID string. */
+     public Optional<SavedStampCoordinateResponse> findStampById(String coordinateId) {
+-        return EntityService.get().semanticsForComponent(stampRegistryNid())
++        long registryNid = stampRegistryNid();
++        return EntityService.get().semanticsForComponent(registryNid)
+                 .map(this::deserializeStampSemantic)
+                 .flatMap(Optional::stream)
+                 .filter(result -> result.id().equals(coordinateId))
+@@ -159,9 +151,9 @@ public class CoordinateStoreService {
+      * the same UUID.
+      */
+     public SavedNavigationCoordinateResponse saveNavigation(NavigationCoordinateDto dto) {
++        long registryNid = navigationRegistryNid();
+         NavigationCoordinateRecord record = CoordinateFactory.buildNavigationCoordinate(dto);
+         UUID coordinateUuid = record.getNavigationCoordinateUuid();
+-        long registryNid = navigationRegistryNid();
+ 
+         Optional<SavedNavigationCoordinateResponse> existing = findNavigationById(coordinateUuid.toString());
+         if (existing.isPresent()) {
+@@ -208,15 +200,17 @@ public class CoordinateStoreService {
+ 
+     /** List all saved NavigationCoordinates in the dataset. */
+     public List<SavedNavigationCoordinateResponse> findAllNavigation() {
++        long registryNid = navigationRegistryNid();
+         List<SavedNavigationCoordinateResponse> results = new ArrayList<>();
+-        EntityService.get().forEachSemanticForComponent(navigationRegistryNid(),
++        EntityService.get().forEachSemanticForComponent(registryNid,
+                 semantic -> deserializeNavigationSemantic(semantic).ifPresent(results::add));
+         return results;
+     }
+ 
+     /** Look up a saved NavigationCoordinate by its content-derived UUID string. */
+     public Optional<SavedNavigationCoordinateResponse> findNavigationById(String coordinateId) {
+-        return EntityService.get().semanticsForComponent(navigationRegistryNid())
++        long registryNid = navigationRegistryNid();
++        return EntityService.get().semanticsForComponent(registryNid)
+                 .map(this::deserializeNavigationSemantic)
+                 .flatMap(Optional::stream)
+                 .filter(result -> result.id().equals(coordinateId))
+@@ -231,9 +225,9 @@ public class CoordinateStoreService {
+      * the same UUID.
+      */
+     public SavedLanguageCoordinateResponse saveLanguage(LanguageCoordinateDto dto) {
++        long registryNid = languageRegistryNid();
+         LanguageCoordinateRecord record = CoordinateFactory.buildLanguageCoordinate(dto);
+         UUID coordinateUuid = record.getLanguageCoordinateUuid();
+-        long registryNid = languageRegistryNid();
+ 
+         Optional<SavedLanguageCoordinateResponse> existing = findLanguageById(coordinateUuid.toString());
+         if (existing.isPresent()) {
+@@ -280,15 +274,17 @@ public class CoordinateStoreService {
+ 
+     /** List all saved LanguageCoordinates in the dataset. */
+     public List<SavedLanguageCoordinateResponse> findAllLanguage() {
++        long registryNid = languageRegistryNid();
+         List<SavedLanguageCoordinateResponse> results = new ArrayList<>();
+-        EntityService.get().forEachSemanticForComponent(languageRegistryNid(),
++        EntityService.get().forEachSemanticForComponent(registryNid,
+                 semantic -> deserializeLanguageSemantic(semantic).ifPresent(results::add));
+         return results;
+     }
+ 
+     /** Look up a saved LanguageCoordinate by its content-derived UUID string. */
+     public Optional<SavedLanguageCoordinateResponse> findLanguageById(String coordinateId) {
+-        return EntityService.get().semanticsForComponent(languageRegistryNid())
++        long registryNid = languageRegistryNid();
++        return EntityService.get().semanticsForComponent(registryNid)
+                 .map(this::deserializeLanguageSemantic)
+                 .flatMap(Optional::stream)
+                 .filter(result -> result.id().equals(coordinateId))
+@@ -296,65 +292,35 @@ public class CoordinateStoreService {
+     }
+ 
+     // ────────────────────────────────────────────────────────────────────────
+-    // Registry NID helpers (lazy, double-checked locking)
++    // Non-allocating capability checks, before coordinate construction or transactions.
+ 
+     private long stampRegistryNid() {
+-        if (stampRegistryNid != -1) return stampRegistryNid;
+-        synchronized (this) {
+-            if (stampRegistryNid != -1) return stampRegistryNid;
+-            stampRegistryNid = resolveOrCreateRegistryConcept(STAMP_COORDINATE_REGISTRY_UUID, "STAMP_COORDINATE_REGISTRY");
+-        }
+-        return stampRegistryNid;
++        return requireRegistryPattern(STAMP_COORDINATE_REGISTRY_UUID, "stamp");
+     }
+ 
+     private long navigationRegistryNid() {
+-        if (navigationRegistryNid != -1) return navigationRegistryNid;
+-        synchronized (this) {
+-            if (navigationRegistryNid != -1) return navigationRegistryNid;
+-            navigationRegistryNid = resolveOrCreateRegistryConcept(NAVIGATION_COORDINATE_REGISTRY_UUID, "NAVIGATION_COORDINATE_REGISTRY");
+-        }
+-        return navigationRegistryNid;
++        return requireRegistryPattern(NAVIGATION_COORDINATE_REGISTRY_UUID, "navigation");
+     }
+ 
+     private long languageRegistryNid() {
+-        if (languageRegistryNid != -1) return languageRegistryNid;
+-        synchronized (this) {
+-            if (languageRegistryNid != -1) return languageRegistryNid;
+-            languageRegistryNid = resolveOrCreateRegistryConcept(LANGUAGE_COORDINATE_REGISTRY_UUID, "LANGUAGE_COORDINATE_REGISTRY");
+-        }
+-        return languageRegistryNid;
++        return requireRegistryPattern(LANGUAGE_COORDINATE_REGISTRY_UUID, "language");
+     }
+ 
+-    /**
+-     * Returns the NID for {@code registryUuid}, creating a {@code ConceptRecord} stub if absent.
+-     * The registry concept is used solely as the {@code referencedComponentNid} anchor for
+-     * coordinate semantics; lookup is via {@code semanticsForComponent} (exact 64-bit key),
+-     * not {@code semanticsOfPattern} (which suffers from nid element-sequence collisions).
+-     */
+-    private long resolveOrCreateRegistryConcept(UUID registryUuid, String label) {
+-        PublicId pid = PublicIds.of(registryUuid);
+-        try {
+-            return EntityService.get().nidForPublicId(pid);
+-        } catch (IllegalStateException e) {
+-            // UUID not yet in DB — first use; create the registry concept stub.
++    private long requireRegistryPattern(UUID registryUuid, String type) {
++        long nid = KnownComponents.nid(PublicIds.of(registryUuid))
++                .orElseThrow(() -> new CoordinateCapabilityException(type, registryUuid));
++        PatternEntity<?> pattern = EntityHandle.get(nid).asPattern()
++                .orElseThrow(() -> new CoordinateCapabilityException(type, registryUuid));
++        if (pattern.canceled() || pattern.versions().isEmpty()
++                || pattern.versions().getLast().fieldDefinitions().size() != 2) {
++            throw new CoordinateCapabilityException(type, registryUuid);
+         }
+-        Transaction tx = Transaction.make("Init " + label);
+-        try {
+-            StampEntity<?> stamp = tx.getStamp(
+-                    State.ACTIVE, System.currentTimeMillis(),
+-                    KernelConcept.USER.nid(),
+-                    KernelConcept.SOLOR_OVERLAY_MODULE.nid(),
+-                    KernelConcept.DEVELOPMENT_PATH.nid());
+-            ConceptRecord stub = ConceptRecord.build(registryUuid, stamp.versions().get(0));
+-            EntityService.get().putEntity(stub);
+-            tx.addComponent(stub);
+-            tx.commit();
+-        } catch (Exception e) {
+-            tx.cancel();
+-            throw new RuntimeException("Failed to initialize " + label, e);
++        long stringNid = KnownComponents.nid(KernelConcept.STRING.publicId())
++                .orElseThrow(() -> new CoordinateCapabilityException(type, registryUuid));
++        if (pattern.versions().getLast().fieldDefinitions()
++                .anySatisfy(field -> field.dataTypeNid() != stringNid)) {
++            throw new CoordinateCapabilityException(type, registryUuid);
+         }
+-        long nid = EntityService.get().nidForPublicId(PublicIds.of(registryUuid));
+-        log.debug("Created {} registry concept (nid={})", label, nid);
+         return nid;
+     }
+ 
+diff --git a/src/test/java/dev/ikm/tinkar/service/service/CoordinateStoreCapabilityTest.java b/src/test/java/dev/ikm/tinkar/service/service/CoordinateStoreCapabilityTest.java
+new file mode 100644
+index 0000000..5d93190
+--- /dev/null
++++ b/src/test/java/dev/ikm/tinkar/service/service/CoordinateStoreCapabilityTest.java
+@@ -0,0 +1,51 @@
++package dev.ikm.tinkar.service.service;
++
++import dev.ikm.tinkar.entity.transaction.Transaction;
++import dev.ikm.tinkar.service.controller.knowledgegraph.CoordinateCapabilityAdvice;
++import io.grpc.Status;
++import org.junit.jupiter.api.Test;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++
++import java.util.List;
++import java.util.OptionalLong;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.ArgumentMatchers.any;
++
++class CoordinateStoreCapabilityTest {
++    @Test
++    void missingRegistriesRefuseEveryOperationBeforeFactoryOrTransaction() {
++        try (MockedStatic<KnownComponents> known = Mockito.mockStatic(KnownComponents.class);
++             MockedStatic<Transaction> transactions = Mockito.mockStatic(Transaction.class);
++             MockedStatic<CoordinateFactory> factory = Mockito.mockStatic(CoordinateFactory.class)) {
++            known.when(() -> KnownComponents.nid(any())).thenReturn(OptionalLong.empty());
++            CoordinateStoreService service = new CoordinateStoreService();
++            List<Runnable> operations = List.of(
++                    () -> service.saveStamp(null), () -> service.saveNavigation(null),
++                    () -> service.saveLanguage(null), () -> service.findAllStamp(),
++                    () -> service.findAllNavigation(), () -> service.findAllLanguage(),
++                    () -> service.findStampById("id"), () -> service.findNavigationById("id"),
++                    () -> service.findLanguageById("id"));
++            for (Runnable operation : operations) {
++                assertThatThrownBy(operation::run)
++                        .isInstanceOf(CoordinateCapabilityException.class)
++                        .hasMessageContaining("COORDINATE_REGISTRY_UNAVAILABLE")
++                        .hasMessageContaining("No write attempted");
++            }
++            transactions.verifyNoInteractions();
++            factory.verifyNoInteractions();
++        }
++    }
++
++    @Test
++    void bothTransportsExplainTheMissingCapability() {
++        var error = new CoordinateCapabilityException("stamp", CoordinateStoreService.STAMP_COORDINATE_REGISTRY_UUID);
++        var advice = new CoordinateCapabilityAdvice();
++        assertThat(CoordinateCapabilityAdvice.rest(error).getStatusCode().value()).isEqualTo(412);
++        assertThat(CoordinateCapabilityAdvice.rest(error).getBody()).containsEntry("code", CoordinateCapabilityException.CODE);
++        assertThat(advice.grpc(error).getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
++        assertThat(advice.grpc(error).getDescription()).isEqualTo(error.getMessage());
++    }
++}
+diff --git a/src/test/java/dev/ikm/tinkar/service/service/PublicSubsetCoordinateTest.java b/src/test/java/dev/ikm/tinkar/service/service/PublicSubsetCoordinateTest.java
+new file mode 100644
+index 0000000..660e7ee
+--- /dev/null
++++ b/src/test/java/dev/ikm/tinkar/service/service/PublicSubsetCoordinateTest.java
+@@ -0,0 +1,149 @@
++package dev.ikm.tinkar.service.service;
++
++import dev.ikm.tinkar.common.service.PrimitiveData;
++import dev.ikm.tinkar.common.id.PublicIds;
++import dev.ikm.tinkar.entity.EntityService;
++import dev.ikm.tinkar.entity.FieldDefinitionRecord;
++import dev.ikm.tinkar.entity.PatternRecord;
++import dev.ikm.tinkar.entity.PatternVersionRecord;
++import dev.ikm.tinkar.entity.RecordListBuilder;
++import dev.ikm.tinkar.entity.SemanticRecord;
++import dev.ikm.tinkar.entity.transaction.Transaction;
++import dev.ikm.tinkar.terms.KernelConcept;
++import dev.ikm.tinkar.terms.State;
++import dev.ikm.tinkar.service.dto.StampCoordinateDto;
++import dev.ikm.tinkar.service.service.impl.TinkarPrimitiveImpl;
++import org.eclipse.collections.api.factory.Lists;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.List;
++import java.util.UUID;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.ArgumentMatchers.any;
++
++/**
++ * Opt-in only: the caller must extract a NEW public archive and put the ownership
++ * marker beside it. Never point this test at the current store.
++ */
++@EnabledIfSystemProperty(named = "coordinate.disposable.root", matches = ".+")
++class PublicSubsetCoordinateTest {
++    @Test
++    void unsupportedPublicSubsetAllocatesNoEntitiesStampsIdentifiersOrTransactions() throws Exception {
++        Path root = Path.of(System.getProperty("coordinate.disposable.root")).toRealPath();
++        assertThat(root.toString()).contains("/.local/tinkar-verification/run-");
++        assertThat(Files.readString(root.resolve("DISPOSABLE"))).isEqualTo("fresh-public-gudid\n");
++        assertThat(Files.exists(root.resolve("opened"))).isFalse();
++        Files.createFile(root.resolve("opened"));
++        var primitive = new TinkarPrimitiveImpl(root.resolve("data").toString(), "gudidsubset",
++                "Open SpinedArrayStore");
++        try {
++            var store = new CoordinateStoreService();
++            List<UUID> registries = List.of(CoordinateStoreService.STAMP_COORDINATE_REGISTRY_UUID,
++                    CoordinateStoreService.NAVIGATION_COORDINATE_REGISTRY_UUID,
++                    CoordinateStoreService.LANGUAGE_COORDINATE_REGISTRY_UUID);
++            var idsBefore = registries.stream().map(id -> PrimitiveData.get().hasUuid(id)).toList();
++            int entitiesBefore = countEntities();
++            long sequenceBefore = PrimitiveData.get().writeSequence();
++            try (MockedStatic<Transaction> transactions = Mockito.mockStatic(Transaction.class)) {
++                for (Runnable operation : List.<Runnable>of(
++                        () -> store.saveStamp(null), () -> store.saveNavigation(null),
++                        () -> store.saveLanguage(null), () -> store.findAllStamp(),
++                        () -> store.findAllNavigation(), () -> store.findAllLanguage(),
++                        () -> store.findStampById("id"), () -> store.findNavigationById("id"),
++                        () -> store.findLanguageById("id"))) {
++                    assertThatThrownBy(operation::run).isInstanceOf(CoordinateCapabilityException.class);
++                }
++                transactions.verifyNoInteractions();
++            }
++            assertThat(PrimitiveData.get().writeSequence()).isEqualTo(sequenceBefore);
++            assertThat(countEntities()).isEqualTo(entitiesBefore);
++            assertThat(registries.stream().map(id -> PrimitiveData.get().hasUuid(id)).toList())
++                    .isEqualTo(idsBefore);
++            System.out.println("PUBLIC SUBSET: 9 capability refusals; no transactions, entities, stamps or registry ID allocations");
++            // Test-only provisioning, NOT a service migration: the shipped subset above
++            // remains unsupported. Exercise supported behavior on this disposable copy.
++            for (UUID registry : registries) {
++                installTestRegistry(registry);
++            }
++            verifySupportedSaveListAndIdempotency(store);
++            verifyFailureAfterStampAllocation(store);
++        } finally {
++            primitive.close();
++        }
++    }
++
++    private int countEntities() {
++        var count = new AtomicInteger();
++        EntityService.get().forEachEntity(entity -> count.incrementAndGet());
++        return count.get();
++    }
++
++    private void installTestRegistry(UUID id) {
++        Transaction tx = Transaction.make("TEST ONLY: coordinate registry");
++        try {
++            var stamp = tx.getStamp(State.ACTIVE, System.currentTimeMillis(), KernelConcept.USER.nid(),
++                    KernelConcept.SOLOR_OVERLAY_MODULE.nid(), KernelConcept.DEVELOPMENT_PATH.nid());
++            RecordListBuilder<PatternVersionRecord> versions = RecordListBuilder.make();
++            PatternRecord pattern = PatternRecord.makeNew(PublicIds.of(id), versions);
++            long meaning = KernelConcept.STRING.nid();
++            versions.add(new PatternVersionRecord(pattern, stamp.nid(), meaning, meaning,
++                    Lists.immutable.of(
++                            new FieldDefinitionRecord(meaning, meaning, meaning, stamp.nid(), pattern.nid(), 0),
++                            new FieldDefinitionRecord(meaning, meaning, meaning, stamp.nid(), pattern.nid(), 1))));
++            EntityService.get().putEntity(pattern);
++            tx.addComponent(pattern);
++            tx.commit();
++        } catch (RuntimeException error) {
++            tx.cancel();
++            throw error;
++        }
++    }
++
++    private void verifySupportedSaveListAndIdempotency(CoordinateStoreService store) {
++        var stamp = store.saveStamp(null);
++        var navigation = store.saveNavigation(null);
++        var language = store.saveLanguage(null);
++        long sequence = PrimitiveData.get().writeSequence();
++        assertThat(store.saveStamp(null)).isEqualTo(stamp);
++        assertThat(store.saveNavigation(null)).isEqualTo(navigation);
++        assertThat(store.saveLanguage(null)).isEqualTo(language);
++        assertThat(PrimitiveData.get().writeSequence()).isEqualTo(sequence);
++        assertThat(store.findAllStamp()).containsExactly(stamp);
++        assertThat(store.findAllNavigation()).containsExactly(navigation);
++        assertThat(store.findAllLanguage()).containsExactly(language);
++        assertThat(store.findStampById(stamp.id())).contains(stamp);
++        assertThat(store.findNavigationById(navigation.id())).contains(navigation);
++        assertThat(store.findLanguageById(language.id())).contains(language);
++        System.out.println("TEST-ONLY REGISTRIES: stamp/navigation/language save, list, lookup and repeat-save idempotency passed");
++    }
++
++    private void verifyFailureAfterStampAllocation(CoordinateStoreService store) {
++        var real = EntityService.get();
++        var spy = Mockito.spy(real);
++        Mockito.doThrow(new IllegalStateException("injected semantic persistence failure"))
++                .when(spy).putEntity(any(SemanticRecord.class));
++        int entitiesBefore = countEntities();
++        var stampsBefore = store.findAllStamp();
++        try (MockedStatic<EntityService> entities = Mockito.mockStatic(EntityService.class)) {
++            entities.when(EntityService::get).thenReturn(spy);
++            assertThatThrownBy(() -> store.saveStamp(
++                    new StampCoordinateDto("ACTIVE", 1234567L, null, null, null, null)))
++                    .hasMessage("Failed to save stamp coordinate")
++                    .hasRootCauseMessage("injected semantic persistence failure");
++        }
++        assertThat(store.findAllStamp()).isEqualTo(stampsBefore);
++        int entityDelta = countEntities() - entitiesBefore;
++        // Cancellation is not a physical rollback: the allocated canceled stamp may remain.
++        assertThat(entityDelta).isGreaterThanOrEqualTo(0);
++        System.out.println("INJECTED WRITE FAILURE: no coordinate listed; retained entity delta=" + entityDelta
++                + " (cancellation is not a byte-for-byte rollback)");
++    }
++}

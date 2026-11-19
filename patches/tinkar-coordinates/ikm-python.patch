@@ -1,0 +1,147 @@
+diff --git a/tests/integration/test_knowledge_graph.py b/tests/integration/test_knowledge_graph.py
+index 8b3b720..0d69590 100644
+--- a/tests/integration/test_knowledge_graph.py
++++ b/tests/integration/test_knowledge_graph.py
+@@ -1,6 +1,9 @@
+ """Integration tests for client.knowledge_graph namespace (Tier 2: IkeKnowledgeGraph)."""
+ 
++import os
++
+ import pytest
++from tinkar.exceptions import TinkarError
+ 
+ from tinkar import (
+     AllowedStates,
+@@ -17,33 +20,78 @@ from .conftest import KNOWN_CONCEPT_ID, PARENT_CONCEPT_ID
+ pytestmark = pytest.mark.integration
+ 
+ 
++@pytest.fixture
++def dataset_concept(live_client):
++    """A verified fixture, never an assumed SNOMED installation."""
++    concept_id = os.environ.get("TINKAR_TEST_CONCEPT_ID", KNOWN_CONCEPT_ID)
++    try:
++        live_client.entities.get(concept_id)
++    except TinkarError as error:
++        if error.code == "not_found" or (
++            error.code == "server_error"
++            and "No component in this knowledge base has the public id" in str(error)
++        ):
++            pytest.skip(f"Dataset lacks concept fixture {concept_id}; set TINKAR_TEST_CONCEPT_ID")
++        raise
++    return concept_id
++
++
++@pytest.fixture
++def dataset_parent(live_client):
++    parent_id = os.environ.get("TINKAR_TEST_PARENT_ID", PARENT_CONCEPT_ID)
++    try:
++        live_client.entities.get(parent_id)
++    except TinkarError as error:
++        if error.code == "not_found" or (
++            error.code == "server_error"
++            and "No component in this knowledge base has the public id" in str(error)
++        ):
++            pytest.skip(f"Dataset lacks parent fixture {parent_id}; set TINKAR_TEST_PARENT_ID")
++        raise
++    return parent_id
++
++
++def save_or_skip(save, **settings):
++    """Only an explicit capability error is a skip, never UNKNOWN/500 or a timeout."""
++    try:
++        return save(**settings)
++    except TinkarError as error:
++        if error.code == "failed_precondition" and str(error).startswith(
++            "COORDINATE_REGISTRY_UNAVAILABLE:"
++        ):
++            pytest.skip(str(error))
++        raise
++
++
+ class TestSemantics:
+-    def test_returns_semantics(self, live_client):
+-        response = live_client.knowledge_graph.semantics(KNOWN_CONCEPT_ID)
++    def test_returns_semantics(self, live_client, dataset_concept):
++        response = live_client.knowledge_graph.semantics(dataset_concept)
+         assert isinstance(response, ConceptSemanticsResponse)
+         assert response.success is True
+-        assert KNOWN_CONCEPT_ID in response.concept_public_id
++        assert dataset_concept in response.concept_public_id
+         assert response.total_count > 0
+ 
+ 
+ class TestKGChildren:
+-    def test_returns_concepts(self, live_client):
+-        response = live_client.knowledge_graph.children(PARENT_CONCEPT_ID)
++    def test_returns_concepts(self, live_client, dataset_parent):
++        response = live_client.knowledge_graph.children(dataset_parent)
+         assert isinstance(response, ConceptListResponse)
+         assert response.success is True
+         assert response.total_count > 0
+ 
+ 
+ class TestKGDescendants:
+-    def test_returns_response(self, live_client):
+-        response = live_client.knowledge_graph.descendants(PARENT_CONCEPT_ID)
++    def test_returns_response(self, live_client, dataset_parent):
++        response = live_client.knowledge_graph.descendants(dataset_parent)
+         assert isinstance(response, ConceptListResponse)
+         assert response.success is True
+ 
+ 
+ class TestStampCoordinates:
+-    def test_save_then_list_then_use(self, live_client):
+-        saved = live_client.knowledge_graph.save_stamp_coordinate(
++    pytestmark = pytest.mark.integration_destructive
++
++    def test_save_then_list_then_use(self, live_client, dataset_concept):
++        saved = save_or_skip(live_client.knowledge_graph.save_stamp_coordinate,
+             allowed_states=AllowedStates.ACTIVE
+         )
+         assert isinstance(saved, SavedCoordinateResponse)
+@@ -55,24 +103,28 @@ class TestStampCoordinates:
+ 
+         # Use the saved coordinate for a coordinate-aware semantics lookup.
+         response = live_client.knowledge_graph.semantics_with_coordinate(
+-            KNOWN_CONCEPT_ID, stamp_coordinate_id=saved.id
++            dataset_concept, stamp_coordinate_id=saved.id
+         )
+         assert isinstance(response, ConceptSemanticsResponse)
+         assert response.success is True
+ 
+     def test_save_is_idempotent(self, live_client):
+-        a = live_client.knowledge_graph.save_stamp_coordinate(
++        a = save_or_skip(live_client.knowledge_graph.save_stamp_coordinate,
+             allowed_states=AllowedStates.ACTIVE
+         )
+-        b = live_client.knowledge_graph.save_stamp_coordinate(
++        b = save_or_skip(live_client.knowledge_graph.save_stamp_coordinate,
+             allowed_states=AllowedStates.ACTIVE
+         )
+         assert a.id == b.id
++        listed = live_client.knowledge_graph.list_stamp_coordinates()
++        assert sum(s.id == a.id for s in listed.stamps) == 1
+ 
+ 
+ class TestNavigationCoordinates:
++    pytestmark = pytest.mark.integration_destructive
++
+     def test_save_and_list(self, live_client):
+-        saved = live_client.knowledge_graph.save_navigation_coordinate(
++        saved = save_or_skip(live_client.knowledge_graph.save_navigation_coordinate,
+             premise_type=PremiseType.INFERRED
+         )
+         assert saved.id
+@@ -81,8 +133,10 @@ class TestNavigationCoordinates:
+ 
+ 
+ class TestLanguageCoordinates:
++    pytestmark = pytest.mark.integration_destructive
++
+     def test_save_and_list(self, live_client):
+-        saved = live_client.knowledge_graph.save_language_coordinate(
++        saved = save_or_skip(live_client.knowledge_graph.save_language_coordinate,
+             language_preset=LanguagePreset.US_ENGLISH_REGULAR_NAME
+         )
+         assert saved.id
