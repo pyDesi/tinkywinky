@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import { resolveWorkspaceRoot } from "../lib/workspace-root";
 import {
   GetWorkbenchStatusResponse,
   ListScenariosResponse,
@@ -12,8 +13,8 @@ import {
 
 const router: IRouter = Router();
 const execute = promisify(execFile);
-// The workflow runs in the API artifact; built and source executions share cwd.
-const root = path.resolve(process.cwd(), "../..");
+// Publishing launches from the workspace root; workflows launch in the artifact.
+const root = resolveWorkspaceRoot();
 const scenarios = ListScenariosResponse.parse(
   JSON.parse(readFileSync(path.join(root, "scripts/tinkar-scenarios.json"), "utf8")),
 );

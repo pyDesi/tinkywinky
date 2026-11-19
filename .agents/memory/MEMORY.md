@@ -3,3 +3,4 @@
 - [Tinkar verification safety](tinkar-verification-safety.md) — upstream destructive markers miss coordinate writes; whole scenario suites require disposable stores.
 - [Tinkar search serialization](tinkar-search-serialization.md) — concurrent device searches can mix results; queue comparisons and avoid search-based health polling.
 - [Project Git attribution](git-attribution.md) — use the creator’s existing Git identity; automatic checkpoints may override local author settings.
+- [Runtime asset paths](runtime-asset-paths.md) — publishing and development launch from different directories; locate assets relative to the runtime module.
